@@ -1,0 +1,66 @@
+x-vox-version: 1
+schema_version: 1
+description: >
+  TopHud tile catalog and layout schema for the vox-gui dashboard.
+  Runtime configs are validated client-side via useHudTiles.ts and persisted
+  under gui.hud.tiles.v1 (see shell-persistence.v1.yaml).
+
+tile_kinds:
+  - active_agents
+  - budget_burn
+  - mesh_peers
+  - active_model
+  - pending_approvals
+
+# Retired 2026-09-28 (chat-surfaces consolidation): queue_depth merged into the
+# Engine card (active_agents), openrouter_spend into the Spend card popover
+# (budget_burn). Stored configs that list them load with those entries dropped.
+retired_tile_kinds:
+  - queue_depth
+  - openrouter_spend
+
+data_bindings:
+  active_agents:
+    source: orchestrator_status
+    field: agent_count
+  budget_burn:
+    source: orchestrator_status
+    field: budget_burn_usd
+  mesh_peers:
+    source: orchestrator_status
+    field: peers.length
+  active_model:
+    source: transport
+    method: get_active_model
+  pending_approvals:
+    source: orchestrator_status
+    field: approvals_pending
+
+tile_shape:
+  id: string # must match a tile_kinds entry
+  kind: string # one of tile_kinds
+  enabled: boolean
+
+config_shape:
+  version: 1
+  tiles:
+    - tile_shape
+
+default_profile:
+  version: 1
+  tiles:
+    - id: active_agents
+      kind: active_agents
+      enabled: true
+    - id: budget_burn
+      kind: budget_burn
+      enabled: true
+    - id: mesh_peers
+      kind: mesh_peers
+      enabled: true
+    - id: active_model
+      kind: active_model
+      enabled: true
+    - id: pending_approvals
+      kind: pending_approvals
+      enabled: true
