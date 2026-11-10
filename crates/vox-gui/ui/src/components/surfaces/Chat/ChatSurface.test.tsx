@@ -1,0 +1,1759 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import React from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+const { mockSecretaryPayload, getSecretaryEventHandler, setSecretaryEventHandler } = vi.hoisted(() => {
+  let secretaryEventHandler: ((event: { payload: any }) => void) | null = null;
+  return {
+    mockSecretaryPayload: {
+      item_id: 'item-abc',
+      intent: 'Fix the broken authentication flow in the login page today',
+      confidence_pct: 85,
+      session_id: 's1',
+    },
+    getSecretaryEventHandler: () => secretaryEventHandler,
+    setSecretaryEventHandler: (handler: any) => {
+      secretaryEventHandler = handler;
+    },
+  };
+});
+
+vi.mock('../../../transport', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../transport')>();
+  return {
+    ...actual,
+    listenSecretaryProposed: vi.fn((handler: (payload: any) => void) => {
+      setSecretaryEventHandler((event: any) => handler(event.payload));
+      return Promise.resolve(() => {});
+    }),
+  };
+});
+
+
+
+const invokeMock = vi.fn();
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+}));
+
+const noopToast = () => {};
+
+/** Live plan identity — required for To-dos to auto-create. */
+const LIVE_PLAN = { planSessionId: 'sess-1', planVersion: 1 as const };
+
+async function openTodosFromPanels() {
+  fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+  fireEvent.click(screen.getByRole('checkbox', { name: /^to-dos$/i }));
+  await screen.findByTestId('chat-dock-todos');
+  fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+}
+
+import { ChatSurface, ApprovalsDockPanel, MercatusDockPanel, RepositoryDockPanel, NeedsYouDockPanel, VoxGraphDockPanel, ActivityDockPanel } from './ChatSurface';
+import type { ChatMessage } from '../../../lib/chatCorrelation';
+import { WORKBENCH_TABBAR_TRAILING_SLOT_ID } from '../../../lib/domIds';
+import { LanguageProvider } from '../../../hooks/useLanguage';
+
+
+describe('ChatSurface', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'chat_list_sessions') {
+        return Promise.resolve([
+          { session_id: 's1', title: 'First', message_count: 2 },
+          { session_id: 's2', title: 'Second', message_count: 0 },
+        ]);
+      }
+      if (cmd === 'list_plan_nodes') {
+        return Promise.resolve([]);
+      }
+      return Promise.resolve(null);
+    });
+  });
+
+  afterEach(() => {
+    localStorage.removeItem('vox.metric.series.v1.chat.session-spend');
+  });
+
+  it('hands the rail its routing and re-reads the context budget when a turn completes (plan 3a)', async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((cmd: string, ...rest: unknown[]) =>
+      cmd === 'get_context_budget'
+        ? Promise.resolve({
+            max_context_tokens: 1000,
+            reserved_tokens: 0,
+            threshold_tokens: 800,
+            usable_tokens: 1000,
+            strategy: 'balanced',
+            used_tokens: 10,
+          })
+        : base(cmd, ...rest),
+    );
+    const reply = (status: 'streaming' | 'done'): ChatMessage => ({
+      id: 'a1',
+      role: 'assistant',
+      text: 'x',
+      status,
+      runId: 'r1',
+    });
+    const routing = { model: 'deepseek/deepseek-flash (offline)', reason: null, state: null, alternatives: [] };
+    const ui = (messages: ChatMessage[]) => (
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          messages={messages}
+          composer={<div>composer</div>}
+          activeSessionId="sess-a"
+          routing={routing}
+        />
+      </LanguageProvider>
+    );
+    const budgetCalls = () => invokeMock.mock.calls.filter(([c]) => c === 'get_context_budget').length;
+    const { rerender } = render(ui([reply('streaming')]));
+    expect(await screen.findByTestId('execution-rail-routing')).toHaveTextContent(
+      'Routes to deepseek/deepseek-flash (offline)',
+    );
+    await waitFor(() => expect(budgetCalls()).toBeGreaterThan(0));
+    const before = budgetCalls();
+    rerender(ui([reply('done')]));
+    await waitFor(() => expect(budgetCalls()).toBe(before + 1));
+  });
+
+  it('leaves the page h1 to the shell: its empty-state title is an h2 and there is no h1', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={() => {}} activeSessionId="s1" />
+      </LanguageProvider>,
+    );
+    expect(await screen.findByRole('heading', { level: 2, name: /no messages yet/i })).toBeInTheDocument();
+    expect(screen.queryAllByRole('heading', { level: 1 })).toHaveLength(0);
+  });
+
+  it('renders an empty state when the session has no messages', async () => {
+    render(<LanguageProvider><ChatSurface pushToast={noopToast} activeSessionId="s1" messages={[]} /></LanguageProvider>);
+    await waitFor(() => {
+      expect(screen.getByText(/no messages yet/i)).toBeDefined();
+    });
+  });
+
+  it('gives the empty-state title the heading level after the h1 (axe heading-order)', async () => {
+    render(<LanguageProvider><ChatSurface pushToast={noopToast} activeSessionId="s1" messages={[]} /></LanguageProvider>);
+    expect(await screen.findByRole('heading', { level: 2, name: /no messages yet/i })).toBeDefined();
+  });
+
+  it('updates the transcript panel content when messages change (does not go stale after first render)', async () => {
+    const { rerender } = render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} activeSessionId="s1" messages={[]} />
+      </LanguageProvider>,
+    );
+    rerender(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          messages={[{ id: 'm1', role: 'user', text: 'hello', status: 'done' } as ChatMessage]}
+        />
+      </LanguageProvider>,
+    );
+    expect(await screen.findByText('hello')).toBeInTheDocument();
+  });
+
+  it('exposes the transcript as a polite log region when messages exist', async () => {
+    const messages: ChatMessage[] = [
+      { id: 'm1', role: 'user', text: 'hi', status: 'done' } as ChatMessage,
+    ];
+    render(<LanguageProvider><ChatSurface pushToast={noopToast} activeSessionId="s1" messages={messages} /></LanguageProvider>);
+    const log = await screen.findByRole('log', { name: /chat transcript/i });
+    expect(log.getAttribute('aria-live')).toBe('polite');
+  });
+
+  it('renders a status line (not raw event rows) when a task is in-flight', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[
+            {
+              id: 'evt-1',
+              kind: 'agent',
+              tag: 'TASK',
+              title: 'TASK · task 7',
+              body: 'agent agent-1',
+              ts: '12:00',
+              taskId: 7,
+              metadata: { eventType: 'task_started', agentId: 'agent-1', timestampMs: 1000 },
+            },
+          ]}
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-status-line')).toBeDefined();
+    });
+    expect(screen.queryByTestId('chat-agent-event-row')).toBeNull();
+  });
+
+  it('renders embedded composer when composer slot is provided', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          composer={<div data-testid="loquela-composer">composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('loquela-composer')).toBeDefined();
+    });
+  });
+
+  it('does not render its own model pill when a composer slot is provided', async () => {
+    // The model-route picker used to be a second row ChatSurface rendered
+    // below the composer. It now lives inside the composer's own toolbar
+    // row (Loquela's `trailingSlot`, wired by App.tsx) — with a real
+    // Loquela this test's plain-div composer stub can't exercise that, but
+    // ChatSurface itself must no longer render a duplicate/stray picker.
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          composer={<div data-testid="loquela-composer">composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('loquela-composer')).toBeDefined();
+    });
+    expect(screen.queryByRole('button', { name: /^model:/i })).toBeNull();
+  });
+
+  it('transcript fills the column (flex-1) instead of a max-h vh cap', async () => {
+    const messages: ChatMessage[] = [
+      { id: 'm1', role: 'user', text: 'hi', status: 'done' } as ChatMessage,
+    ];
+    render(<LanguageProvider><ChatSurface pushToast={noopToast} activeSessionId="s1" messages={messages} /></LanguageProvider>);
+    const log = await screen.findByRole('log', { name: /chat transcript/i });
+    expect(log.className).toContain('flex-1');
+    expect(log.className).toContain('min-h-0');
+    expect(log.className).not.toContain('max-h-[40vh]');
+  });
+
+  it('shows SecretaryToast when secretary-proposed-task event fires', async () => {
+    const onNavigate = vi.fn();
+    render(<LanguageProvider><ChatSurface pushToast={noopToast} onNavigate={onNavigate} activeSessionId="s1" /></LanguageProvider>);
+    // Wait for the listen subscriptions to be set up
+    await waitFor(() => expect(getSecretaryEventHandler()).not.toBeNull());
+    // Simulate the event
+    act(() => {
+      getSecretaryEventHandler()!({ payload: mockSecretaryPayload });
+    });
+    // Toast should appear
+    await waitFor(() => {
+      expect(screen.getByTestId('secretary-toast-intent')).toBeInTheDocument();
+      expect(screen.getByText(/Fix the broken authentication/)).toBeInTheDocument();
+    });
+    // Task 0.2: the proposal alone must never call secretary_confirm_task —
+    // only an explicit click on "Add task" may.
+    expect(invokeMock).not.toHaveBeenCalledWith('secretary_confirm_task', expect.anything());
+  });
+
+  it('only submits the secretary-proposed task when "Add task" is clicked (propose-only)', async () => {
+    const onNavigate = vi.fn();
+    render(<LanguageProvider><ChatSurface pushToast={noopToast} onNavigate={onNavigate} activeSessionId="s1" /></LanguageProvider>);
+    await waitFor(() => expect(getSecretaryEventHandler()).not.toBeNull());
+    act(() => {
+      getSecretaryEventHandler()!({ payload: mockSecretaryPayload });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('secretary-toast-intent')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /confirm and add task/i }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('secretary_confirm_task', {
+        sessionId: mockSecretaryPayload.session_id,
+        intent: mockSecretaryPayload.intent,
+        activeSkill: null,
+      });
+    });
+    expect(onNavigate).toHaveBeenCalledWith('tasks');
+  });
+
+  it('passes activeSkillId through to secretary_confirm_task', async () => {
+    const onNavigate = vi.fn();
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={onNavigate}
+          activeSessionId="s1"
+          activeSkillId="code-review"
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => expect(getSecretaryEventHandler()).not.toBeNull());
+    act(() => {
+      getSecretaryEventHandler()!({ payload: mockSecretaryPayload });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('secretary-toast-intent')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /confirm and add task/i }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('secretary_confirm_task', {
+        sessionId: mockSecretaryPayload.session_id,
+        intent: mockSecretaryPayload.intent,
+        activeSkill: 'code-review',
+      });
+    });
+  });
+
+  it('shows AttentionBudgetMeter above composer when budget present', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          composer={<div data-testid="loquela-composer">composer</div>}
+          attention_budget={{
+            max_attention_ms: 600_000,
+            spent_ms: 300_000,
+            total_requests: 10,
+            auto_approved: 8,
+            rejected: 1,
+            interrupt_freq_per_hour: 5,
+            last_interrupt_ms: 0,
+            inbox_suppressed_count: 2,
+          }}
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('meter', { name: /attention spent/i })).toBeDefined();
+    });
+    expect(screen.getByTestId('chat-attention-meter')).toBeDefined();
+  });
+
+  it('renders a dismissible Session Wrap-Up card when attention_budget is exhausted (HUMANE-04)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          composer={<div data-testid="loquela-composer">composer</div>}
+          attention_budget={{
+            max_attention_ms: 600_000,
+            spent_ms: 600_000,
+            total_requests: 15,
+            auto_approved: 10,
+            rejected: 0,
+            interrupt_freq_per_hour: 4,
+            last_interrupt_ms: 0,
+            inbox_suppressed_count: 0,
+            exhausted: true,
+            alert_level: 'Critical',
+          }}
+        />
+      </LanguageProvider>,
+    );
+    const card = await screen.findByTestId('humane-session-wrapup-card');
+    expect(card).toHaveTextContent(/Session Wrap-Up — Natural Stopping Point/i);
+    fireEvent.click(screen.getByRole('button', { name: /dismiss session wrap-up/i }));
+    expect(screen.queryByTestId('humane-session-wrapup-card')).toBeNull();
+  });
+
+  it('mounts chat and execution rail as dockview panels (Task 9: no Sessions dockview panel)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as ChatMessage]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-dock-transcript')).toBeInTheDocument();
+      expect(screen.getByTestId('chat-dock-execution-rail')).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('chat-dock-sessions')).toBeNull();
+  });
+
+  it('shows a session-spend spark after sessionSpentUsd changes', async () => {
+    const { rerender } = render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          messages={[]}
+          composer={<div>composer</div>}
+          sessionSpentUsd={0.1}
+        />
+      </LanguageProvider>,
+    );
+    rerender(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          messages={[]}
+          composer={<div>composer</div>}
+          sessionSpentUsd={0.4}
+        />
+      </LanguageProvider>,
+    );
+    expect(await screen.findByTestId('execution-rail-spend-spark')).toBeInTheDocument();
+  });
+
+  it('transcript dock does not use overflow-y-auto on the panel that hosts the composer', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    const panel = await screen.findByTestId('chat-dock-transcript');
+    expect(panel.className).not.toMatch(/overflow-y-auto/);
+  });
+
+  it('the transcript panel has no visible tab strip (pinned, not a normal closable/draggable panel)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    expect(screen.queryByText('Chat', { selector: '.dv-default-tab-content' })).toBeNull();
+  });
+
+  it('prevents a native dragstart originating from the transcript panel tab (EmptyTab hides chrome but dockview-core still sets draggable=true unconditionally)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    const transcriptTabMarker = await screen.findByTestId('chat-dock-transcript-tab-marker');
+    const transcriptTab = transcriptTabMarker.closest('.dv-tab') as HTMLElement;
+    expect(transcriptTab).not.toBeNull();
+
+    const event = new Event('dragstart', { bubbles: true, cancelable: true }) as DragEvent;
+    Object.defineProperty(event, 'dataTransfer', {
+      value: { setDragImage: vi.fn(), setData: vi.fn(), getData: vi.fn(), types: [], items: [], effectAllowed: '' },
+    });
+    act(() => {
+      transcriptTab.dispatchEvent(event);
+    });
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it('dragstart is preventDefault-ed dock-wide now that dndStrategy="pointer" disables the HTML5 backend entirely (dockview-core\'s own Html5DragSource does this, not app code) — the transcript-only *scoping* now lives in the pointermove-suppression logic covered below', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await openTodosFromPanels();
+    const todosTab = screen.getByText('To-dos').closest('.dv-tab') as HTMLElement;
+    expect(todosTab).not.toBeNull();
+
+    const event = new Event('dragstart', { bubbles: true, cancelable: true }) as DragEvent;
+    Object.defineProperty(event, 'dataTransfer', {
+      value: { setDragImage: vi.fn(), setData: vi.fn(), getData: vi.fn(), types: [], items: [], effectAllowed: '' },
+    });
+    act(() => {
+      todosTab.dispatchEvent(event);
+    });
+    // Task 1: with `dndStrategy="pointer"`, dockview-core's Html5DragSource
+    // is constructed with `disabled: true` for every tab (caps.html5 is
+    // false dock-wide) and preventDefault()s any dragstart unconditionally
+    // — see dockview-core's dnd/backend.js. This is no longer a
+    // transcript-specific signal, so this test only documents that fact;
+    // the real "only the transcript tab's drag is suppressed" guarantee is
+    // now exercised via pointermove (the event that actually arms a drag
+    // under the pointer backend) in the tests below.
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it('does not suppress pointermove for a real, unrelated panel tab (To-dos) — the pointer-drag suppression is scoped to the transcript panel only', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await openTodosFromPanels();
+    const todosTab = screen.getByText('To-dos').closest('.dv-tab') as HTMLElement;
+    expect(todosTab).not.toBeNull();
+
+    const pointerDown = new Event('pointerdown', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(pointerDown, 'pointerId', { value: 99 });
+    act(() => {
+      todosTab.dispatchEvent(pointerDown);
+    });
+
+    const pointerMove = new Event('pointermove', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(pointerMove, 'pointerId', { value: 99 });
+    act(() => {
+      window.dispatchEvent(pointerMove);
+    });
+    expect(pointerMove.defaultPrevented).toBe(false);
+  });
+
+  it('suppresses pointer-driven drag-arming for the transcript tab (dndStrategy="pointer" path) without blocking its own pointerdown / click-to-activate', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    const transcriptTabMarker = await screen.findByTestId('chat-dock-transcript-tab-marker');
+    const transcriptTab = transcriptTabMarker.closest('.dv-tab') as HTMLElement;
+    expect(transcriptTab).not.toBeNull();
+
+    // pointerdown itself must NOT be suppressed — dockview-core also uses
+    // this exact event to activate the clicked tab, so preventing it would
+    // break tab switching, not just dragging.
+    const pointerDown = new Event('pointerdown', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(pointerDown, 'pointerId', { value: 42 });
+    act(() => {
+      transcriptTab.dispatchEvent(pointerDown);
+    });
+    expect(pointerDown.defaultPrevented).toBe(false);
+
+    // A subsequent pointermove for the *same* pointerId, dispatched on
+    // window (mirroring where dockview-core's PointerDragSource listens),
+    // must be suppressed so the drag never arms past its distance
+    // threshold.
+    const pointerMove = new Event('pointermove', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(pointerMove, 'pointerId', { value: 42 });
+    act(() => {
+      window.dispatchEvent(pointerMove);
+    });
+    expect(pointerMove.defaultPrevented).toBe(true);
+  });
+
+  it('does not suppress pointermove for an unrelated pointerId or after the transcript pointerdown\'s pointer has been released', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    const transcriptTabMarker = await screen.findByTestId('chat-dock-transcript-tab-marker');
+    const transcriptTab = transcriptTabMarker.closest('.dv-tab') as HTMLElement;
+
+    const pointerDown = new Event('pointerdown', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(pointerDown, 'pointerId', { value: 7 });
+    act(() => {
+      transcriptTab.dispatchEvent(pointerDown);
+    });
+
+    // A different pointerId (e.g. a second concurrent pointer) is untouched.
+    const otherMove = new Event('pointermove', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(otherMove, 'pointerId', { value: 8 });
+    act(() => {
+      window.dispatchEvent(otherMove);
+    });
+    expect(otherMove.defaultPrevented).toBe(false);
+
+    // Once pointer 7 is released, its id is no longer tracked as suppressed.
+    const pointerUp = new Event('pointerup', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(pointerUp, 'pointerId', { value: 7 });
+    act(() => {
+      window.dispatchEvent(pointerUp);
+    });
+    const moveAfterUp = new Event('pointermove', { bubbles: true, cancelable: true }) as PointerEvent;
+    Object.defineProperty(moveAfterUp, 'pointerId', { value: 7 });
+    act(() => {
+      window.dispatchEvent(moveAfterUp);
+    });
+    expect(moveAfterUp.defaultPrevented).toBe(false);
+  });
+
+  it('creates the Chat transcript panel with a hard minimumWidth floor and no positional anchor (Task 9: transcript is the dock\'s default/leftmost panel now that Sessions is gone)', async () => {
+    const { DockviewApi } = await import('dockview');
+    const addPanelSpy = vi.spyOn(DockviewApi.prototype, 'addPanel');
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    const transcriptCall = addPanelSpy.mock.calls.find(([opts]) => opts.id === 'transcript');
+    expect(transcriptCall).toBeDefined();
+    expect(transcriptCall![0].minimumWidth).toBe(460);
+    expect(transcriptCall![0].maximumWidth).toBeUndefined();
+    expect(transcriptCall![0].position).toBeUndefined();
+    addPanelSpy.mockRestore();
+  });
+
+  it('closes a stale "sessions" panel restored from a persisted layout (Task 9: pre-existing users have a persisted gui.chat layout that still references the removed Sessions panel/component)', async () => {
+    const { layoutStorageKeyFor } = await import('../../dock/DockWorkspaceShell');
+    // A minimal persisted dockview layout containing a 'sessions' panel —
+    // shaped like what dockview's own toJSON would have produced before
+    // Task 9 removed the panel, trimmed to the fields fromJSON needs.
+    window.localStorage.setItem(
+      layoutStorageKeyFor('gui.chat'),
+      JSON.stringify({
+        grid: {
+          root: {
+            type: 'branch',
+            data: [
+              {
+                type: 'leaf',
+                data: {
+                  views: ['sessions'],
+                  activeView: 'sessions',
+                  id: 'group-sessions',
+                },
+                size: 200,
+              },
+            ],
+            size: 600,
+          },
+          width: 600,
+          height: 600,
+          orientation: 'HORIZONTAL',
+        },
+        panels: {
+          sessions: {
+            id: 'sessions',
+            contentComponent: 'sessions',
+            title: 'Sessions',
+          },
+        },
+        activeGroup: 'group-sessions',
+      }),
+    );
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    // The regression this guards: a persisted layout referencing the
+    // removed 'sessions' panel/component must never leave a stale/broken
+    // panel visible, nor prevent the surface from ending up in a normal
+    // working state. Empirically, dockview-core@6.6.1's `fromJSON` throws on
+    // the unregistered 'sessions' component (see the onReady comment in
+    // ChatSurface.tsx), which DockWorkspaceShell's own try/catch turns into
+    // "revert to a fresh default layout" — so this also exercises that
+    // fallback path, not just the belt-and-suspenders `.api.close()` guard.
+    await waitFor(() => {
+      expect(screen.queryByTestId('chat-dock-sessions')).toBeNull();
+    });
+    expect(screen.getByTestId('chat-dock-transcript')).toBeInTheDocument();
+  });
+
+  it('a 3rd+ opt-in panel stacks BELOW the most-recently-activated opt-in panel instead of splitting the row right again, so an opening row of opt-in panels does not get infinitely thinner', async () => {
+    const { DockviewApi } = await import('dockview');
+    const addPanelSpy = vi.spyOn(DockviewApi.prototype, 'addPanel');
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    await screen.findByTestId('chat-dock-mercatus');
+    fireEvent.click(screen.getByRole('checkbox', { name: /^harness$/i }));
+    await screen.findByTestId('chat-dock-harness');
+    fireEvent.click(screen.getByRole('checkbox', { name: /^repository$/i }));
+    await screen.findByTestId('chat-dock-repository');
+
+    const repositoryCall = addPanelSpy.mock.calls.find(([opts]) => opts.id === 'repository');
+    expect(repositoryCall).toBeDefined();
+    expect(repositoryCall![0].position).toEqual({ direction: 'below', referencePanel: 'harness' });
+    addPanelSpy.mockRestore();
+  });
+
+  it('the Panels menu checkboxes use the app brass/gold design tokens, matching every other checkbox in the codebase', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    const checkbox = screen.getByRole('checkbox', { name: /^market$/i });
+    expect(checkbox.className).toContain('text-brass');
+    expect(checkbox.className).not.toBe('');
+  });
+
+  it('the transcript tab renders a real, visible title in place of the suppressed default chrome', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={noopToast} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    const marker = await screen.findByTestId('chat-dock-transcript-tab-marker');
+    // The marker itself must carry a real, visible title now (Task 1.8 hid
+    // the default tab's chrome but never put a replacement label back,
+    // leaving the tab looking blank/broken).
+    expect(marker.textContent).toBe('Chat');
+    expect(marker).not.toHaveStyle({ display: 'none' });
+  });
+
+  it('does not mount a Flow dock panel — topology lives on Execution and Agents → Flow', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          onNavigate={vi.fn()}
+          activeSessionId="s1"
+          messages={[]}
+          agentStreamItems={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-execution-rail');
+    expect(screen.queryByTestId('chat-dock-flow')).toBeNull();
+    expect(screen.queryByText('Flow')).toBeNull();
+  });
+
+  it('does not auto-create the To-dos panel on default mount (no plan session)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    expect(screen.queryByTestId('chat-dock-todos')).toBeNull();
+  });
+
+  it('closes auto To-dos when the live plan is cleared (A-with-plan → B-without-plan)', async () => {
+    const { rerender } = render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={vi.fn()}
+          onNavigate={vi.fn()}
+          messages={[]}
+          composer={<div>composer</div>}
+          {...LIVE_PLAN}
+        />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-todos');
+    rerender(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={vi.fn()}
+          onNavigate={vi.fn()}
+          messages={[]}
+          composer={<div>composer</div>}
+        />
+      </LanguageProvider>,
+    );
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-todos')).toBeNull());
+  });
+
+  it('does not resurrect the To-dos panel on the next render after the user closes it', async () => {
+    const { rerender } = render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={vi.fn()}
+          onNavigate={vi.fn()}
+          messages={[]}
+          composer={<div>composer</div>}
+          {...LIVE_PLAN}
+        />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-todos');
+
+    // Close the way a user would: find the real dockview tab close action.
+    // NOTE: this app's ChatDockShell does not register a custom React tab
+    // component, so dockview falls back to dockview-core's vanilla
+    // `DefaultTab` (built via plain `document.createElement`, not the
+    // `dockview-react` `DockviewDefaultTab` component) — confirmed via
+    // screen.debug() against the actual rendered tree. That vanilla tab has
+    // no `data-testid` (only `dockview-react`'s version sets one); the class
+    // structure the plan documented is otherwise accurate: `.dv-default-tab`
+    // contains a `.dv-default-tab-content` and a sibling `.dv-default-tab-action`
+    // close target.
+    const todosTab = screen.getByText('To-dos').closest('.dv-default-tab') as HTMLElement;
+    const closeBtn = todosTab.querySelector('.dv-default-tab-action') as HTMLElement;
+    fireEvent.click(closeBtn);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-todos')).toBeNull());
+
+    // Force an unrelated re-render — the exact trigger a real close-fighting
+    // bug would react to (a streamed token, a session poll, anything that
+    // isn't the user reopening the panel).
+    rerender(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={vi.fn()}
+          onNavigate={vi.fn()}
+          messages={[{ id: 'm1', role: 'user', text: 'hello', status: 'done' } as any]}
+          composer={<div>composer</div>}
+          {...LIVE_PLAN}
+        />
+      </LanguageProvider>,
+    );
+
+    // The bug: without a fix, the refresh effect sees getPanel('todos') is
+    // undefined and immediately re-adds it, fighting the user's own close.
+    expect(screen.queryByTestId('chat-dock-todos')).toBeNull();
+  });
+
+  it('mounts the To-dos panel as a dockview panel, not a hand-rolled collapsible aside', () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>}
+          {...LIVE_PLAN}
+        />
+      </LanguageProvider>,
+    );
+    expect(screen.getByTestId('chat-dock-todos')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Collapse plan panel')).toBeNull();
+    expect(screen.queryByLabelText('Expand plan panel')).toBeNull();
+  });
+
+  it('portals the Panels trigger into the workbench tab bar\'s trailing slot when present, instead of rendering its own row (F: the button must sit inline with the top tab bar, not float in a separate row)', () => {
+    const slot = document.createElement('div');
+    slot.id = WORKBENCH_TABBAR_TRAILING_SLOT_ID;
+    document.body.appendChild(slot);
+    try {
+      render(
+        <LanguageProvider>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </LanguageProvider>,
+      );
+      const trigger = screen.getByRole('button', { name: /panels/i });
+      expect(slot.contains(trigger)).toBe(true);
+      // No leftover own-row wrapper duplicating the button outside the slot.
+      expect(screen.getAllByRole('button', { name: /panels/i })).toHaveLength(1);
+    } finally {
+      document.body.removeChild(slot);
+    }
+  });
+
+  it('falls back to rendering its own Panels trigger row when no workbench tab bar slot exists (standalone rendering, e.g. these tests)', () => {
+    expect(document.getElementById(WORKBENCH_TABBAR_TRAILING_SLOT_ID)).toBeNull();
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    expect(screen.getByRole('button', { name: /panels/i })).toBeInTheDocument();
+  });
+
+  // The slot is the status bar at the bottom of the window: a menu that opens downward from it renders below
+  // the viewport and is invisible (found by the review capture's panels-menu-open state).
+  it('opens the Panels menu upward from the status bar slot, and downward from its own row', () => {
+    const menuOf = () => screen.getAllByRole('checkbox')[0].closest('div.absolute') as HTMLElement;
+    const slot = document.createElement('div');
+    slot.id = WORKBENCH_TABBAR_TRAILING_SLOT_ID;
+    document.body.appendChild(slot);
+    try {
+      const { unmount } = render(
+        <LanguageProvider>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </LanguageProvider>,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+      expect(menuOf().className).toContain('bottom-full');
+      expect(menuOf().className).not.toContain('top-full');
+      unmount();
+    } finally {
+      document.body.removeChild(slot);
+    }
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    expect(menuOf().className).toContain('top-full');
+    expect(menuOf().className).not.toContain('bottom-full');
+  });
+
+  it('Panels button toggles a popover open and closed, with Escape and focus-return', () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    const trigger = screen.getByRole('button', { name: /panels/i });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('Panels popover lists To-dos and reopens it on click; clicking outside closes it', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+    expect(screen.queryByTestId('chat-dock-todos')).toBeNull();
+
+    await openTodosFromPanels();
+    const todosTab = screen.getByText('To-dos').closest('.dv-default-tab') as HTMLElement;
+    fireEvent.click(todosTab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-todos')).toBeNull());
+
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^to-dos$/i }));
+    await waitFor(() => expect(screen.getByTestId('chat-dock-todos')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByText('All panels open')).toBeNull();
+  });
+
+  it('Reset layout clears the persisted layout and closedPanelIds, and recreates only transcript + execution', async () => {
+    const { layoutStorageKeyFor } = await import('../../dock/DockWorkspaceShell');
+    window.localStorage.setItem(layoutStorageKeyFor('gui.chat'), JSON.stringify({ grid: {} }));
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-transcript');
+
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('button', { name: /reset layout/i }));
+
+    expect(window.localStorage.getItem(layoutStorageKeyFor('gui.chat'))).toBeNull();
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-dock-transcript')).toBeInTheDocument();
+      expect(screen.getByTestId('chat-dock-execution-rail')).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('chat-dock-todos')).toBeNull();
+    expect(screen.queryByTestId('chat-dock-flow')).toBeNull();
+    expect(screen.queryByTestId('chat-dock-sessions')).toBeNull();
+  });
+
+  it('Reset layout recreates To-dos when a live plan is attached', async () => {
+    const { layoutStorageKeyFor } = await import('../../dock/DockWorkspaceShell');
+    window.localStorage.setItem(layoutStorageKeyFor('gui.chat'), JSON.stringify({ grid: {} }));
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} {...LIVE_PLAN} />
+      </LanguageProvider>,
+    );
+    await screen.findByTestId('chat-dock-todos');
+
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('button', { name: /reset layout/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-dock-transcript')).toBeInTheDocument();
+      expect(screen.getByTestId('chat-dock-execution-rail')).toBeInTheDocument();
+      expect(screen.getByTestId('chat-dock-todos')).toBeInTheDocument();
+    });
+  });
+
+  it('Reset layout does not throw when no layout was ever persisted', () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    expect(() => fireEvent.click(screen.getByRole('button', { name: /reset layout/i }))).not.toThrow();
+  });
+
+  it('mounts a Needs You panel dockable from Chat via the Panels menu Add section', () => {
+    const attention = {
+      approvals: [],
+      needsYou: [],
+      withheld: [],
+      blockedTasksCount: 0,
+      hopperTasks: [],
+      totalCount: 0,
+      refresh: vi.fn(),
+      resolveApproval: vi.fn(),
+      resolveFeedback: vi.fn(),
+    } as any;
+    render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} attention={attention} />
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^needs you$/i }));
+    expect(screen.getByTestId('chat-dock-needs-you')).toBeInTheDocument();
+  });
+
+  it('the Needs You panel does not resurrect on the next render after being closed', async () => {
+    const attention = {
+      approvals: [],
+      needsYou: [],
+      withheld: [],
+      blockedTasksCount: 0,
+      hopperTasks: [],
+      totalCount: 0,
+      refresh: vi.fn(),
+      resolveApproval: vi.fn(),
+      resolveFeedback: vi.fn(),
+    } as any;
+    const { rerender } = render(
+      <LanguageProvider>
+        <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} attention={attention} />
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^needs you$/i }));
+    await screen.findByTestId('chat-dock-needs-you');
+
+    const tab = screen
+      .getAllByText('Needs You')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-needs-you')).toBeNull());
+
+    // Force an unrelated re-render — opt-in panels have NO auto-create
+    // branch, so this must not bring it back (by construction, not by a
+    // closedPanelIds guard, since opt-in panels don't use one).
+    rerender(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={vi.fn()}
+          onNavigate={vi.fn()}
+          messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as any]}
+          composer={<div>composer</div>}
+          attention={attention}
+        />
+      </LanguageProvider>,
+    );
+    expect(screen.queryByTestId('chat-dock-needs-you')).toBeNull();
+  });
+
+  it('mounts a VoxGraph status panel dockable from Chat via the Panels menu Add section', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^search index$/i }));
+    expect(screen.getByTestId('chat-dock-voxgraph')).toBeInTheDocument();
+  });
+
+  it('the VoxGraph panel does not resurrect on the next render after being closed', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^search index$/i }));
+    await screen.findByTestId('chat-dock-voxgraph');
+
+    const tab = screen
+      .getAllByText('Search Index')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-voxgraph')).toBeNull());
+
+    // Force an unrelated re-render — opt-in panels have NO auto-create
+    // branch, so this must not bring it back (by construction, not by a
+    // closedPanelIds guard, since opt-in panels don't use one).
+    rerender(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface
+            pushToast={vi.fn()}
+            onNavigate={vi.fn()}
+            messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as any]}
+            composer={<div>composer</div>}
+          />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    expect(screen.queryByTestId('chat-dock-voxgraph')).toBeNull();
+  });
+
+  it('mounts an Activity panel dockable from Chat via the Panels menu Add section', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^discovery$/i }));
+    expect(screen.getByTestId('chat-dock-activity')).toBeInTheDocument();
+  });
+
+  it('mounts a Research panel dockable from Chat via the Panels menu Add section', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^research$/i }));
+    expect(screen.getByTestId('chat-dock-research')).toBeInTheDocument();
+  });
+
+  it('the Activity panel does not resurrect on the next render after being closed', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^discovery$/i }));
+    await screen.findByTestId('chat-dock-activity');
+
+    const tab = screen
+      .getAllByText('Discovery')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-activity')).toBeNull());
+
+    // Force an unrelated re-render — opt-in panels have NO auto-create
+    // branch, so this must not bring it back (by construction, not by a
+    // closedPanelIds guard, since opt-in panels don't use one).
+    rerender(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface
+            pushToast={vi.fn()}
+            onNavigate={vi.fn()}
+            messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as any]}
+            composer={<div>composer</div>}
+          />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    expect(screen.queryByTestId('chat-dock-activity')).toBeNull();
+  });
+
+  it('mounts a Repository panel dockable from Chat via the Panels menu Add section', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^repository$/i }));
+    expect(screen.getByTestId('chat-dock-repository')).toBeInTheDocument();
+  });
+
+  it('the Repository panel does not resurrect on the next render after being closed', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^repository$/i }));
+    await screen.findByTestId('chat-dock-repository');
+
+    const tab = screen
+      .getAllByText('Repository')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-repository')).toBeNull());
+
+    // Force an unrelated re-render — opt-in panels have NO auto-create
+    // branch, so this must not bring it back (by construction, not by a
+    // closedPanelIds guard, since opt-in panels don't use one).
+    rerender(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface
+            pushToast={vi.fn()}
+            onNavigate={vi.fn()}
+            messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as any]}
+            composer={<div>composer</div>}
+          />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    expect(screen.queryByTestId('chat-dock-repository')).toBeNull();
+  });
+
+  it('mounts a Mercatus panel dockable from Chat via the Panels menu Add section', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    expect(screen.getByTestId('chat-dock-mercatus')).toBeInTheDocument();
+  });
+
+  it('the Mercatus panel does not resurrect on the next render after being closed', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    await screen.findByTestId('chat-dock-mercatus');
+
+    const tab = screen
+      .getAllByText('Market')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-mercatus')).toBeNull());
+
+    // Force an unrelated re-render — opt-in panels have NO auto-create
+    // branch, so this must not bring it back (by construction, not by a
+    // closedPanelIds guard, since opt-in panels don't use one).
+    rerender(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface
+            pushToast={vi.fn()}
+            onNavigate={vi.fn()}
+            messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as any]}
+            composer={<div>composer</div>}
+          />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    expect(screen.queryByTestId('chat-dock-mercatus')).toBeNull();
+  });
+
+  it('mounts a Harness panel dockable from Chat via the Panels menu Add section', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^harness$/i }));
+    expect(screen.getByTestId('chat-dock-harness')).toBeInTheDocument();
+  });
+
+  it('positions a newly-activated opt-in panel after the most-recently-activated opt-in panel, not a fixed referenceChain slot', async () => {
+    // Real assertion mechanism: spy on DockviewApi.prototype.addPanel (the
+    // real dockview library runs in this jsdom suite — nothing about it is
+    // mocked) and inspect the `position.referencePanel` dockview actually
+    // received for Harness's addPanel call. The old fixed referenceChain for
+    // every opt-in panel was `['todos', 'executionRail',
+    // 'transcript']`. Activation-order positioning must instead reference
+    // 'mercatus', the panel activated immediately before Harness. Asserting
+    // "both panels exist" alone (as the plan's own Step 1 sketch left
+    // unresolved) would pass under either implementation and prove nothing
+    // about relative position — this asserts the actual argument dockview's
+    // API received, which only the new behavior can produce.
+    const { DockviewApi } = await import('dockview');
+    const addPanelSpy = vi.spyOn(DockviewApi.prototype, 'addPanel');
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    await screen.findByTestId('chat-dock-mercatus');
+    fireEvent.click(screen.getByRole('checkbox', { name: /^harness$/i }));
+    await screen.findByTestId('chat-dock-harness');
+
+    const harnessCall = addPanelSpy.mock.calls.find(([opts]) => opts.id === 'harness');
+    expect(harnessCall).toBeDefined();
+    expect(harnessCall![0].position).toEqual({ direction: 'right', referencePanel: 'mercatus' });
+    addPanelSpy.mockRestore();
+  });
+
+  it('the Harness panel does not resurrect on the next render after being closed', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^harness$/i }));
+    await screen.findByTestId('chat-dock-harness');
+
+    const tab = screen
+      .getAllByText('Harness')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-harness')).toBeNull());
+
+    // Force an unrelated re-render — opt-in panels have NO auto-create
+    // branch, so this must not bring it back (by construction, not by a
+    // closedPanelIds guard, since opt-in panels don't use one).
+    rerender(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface
+            pushToast={vi.fn()}
+            onNavigate={vi.fn()}
+            messages={[{ id: 'm1', role: 'user', text: 'hi', status: 'done' } as any]}
+            composer={<div>composer</div>}
+          />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    expect(screen.queryByTestId('chat-dock-harness')).toBeNull();
+  });
+
+  it('Panels menu uses checkboxes, live-applying on check without closing the dropdown', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    const checkbox = screen.getByRole('checkbox', { name: /^market$/i });
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
+    await screen.findByTestId('chat-dock-mercatus');
+    expect(checkbox).toBeChecked();
+    // Dropdown stays open — the trigger's aria-expanded must still be true.
+    expect(screen.getByRole('button', { name: /panels/i }).getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('clicking a Panels checkbox with a real pointer event sequence (mousedown+click, not just a synthetic click) toggles the panel and keeps the dropdown open (regression: outside-mousedown-closer treated the checkbox itself as "outside")', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    await user.click(screen.getByRole('button', { name: /panels/i }));
+    expect(screen.getByRole('button', { name: /panels/i }).getAttribute('aria-expanded')).toBe('true');
+
+    const checkbox = screen.getByRole('checkbox', { name: /^market$/i });
+    expect(checkbox).not.toBeChecked();
+    // userEvent.click fires the full pointerdown/mousedown/pointerup/mouseup/click
+    // sequence, exactly like a real mouse click — unlike fireEvent.click, which
+    // only dispatches the bare 'click' event and never exercises the
+    // document-level 'mousedown' outside-close listener.
+    await user.click(checkbox);
+
+    // The dropdown must still be open — this is the live bug report: "I can't
+    // click on any of those checkboxes... it just closes the panel dropdown."
+    expect(screen.getByRole('button', { name: /panels/i }).getAttribute('aria-expanded')).toBe('true');
+    await screen.findByTestId('chat-dock-mercatus');
+    expect(checkbox).toBeChecked();
+  });
+
+  it('unchecking a panel closes it', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    await screen.findByTestId('chat-dock-mercatus');
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-mercatus')).toBeNull());
+  });
+
+  it('checking two panels back-to-back with no await between clicks keeps both checked (regression: checked read from a live ref at render time desyncs on rapid multi-toggle)', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+
+    // Force a React re-render in between the two toggles — the same thing a
+    // streamed token, a session poll, or any unrelated prop change does in
+    // the real app between two rapid clicks. No await/waitFor: this must
+    // happen before dockview's own event round-trip could settle. If
+    // `checked` were still computed by reading dockApiRef at render time,
+    // this reconciliation pass would stomp the DOM's checked state for
+    // Mercatus back to its stale (unchecked) last-rendered value.
+    rerender(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /^harness$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-dock-mercatus')).toBeInTheDocument();
+      expect(screen.getByTestId('chat-dock-harness')).toBeInTheDocument();
+    });
+
+    const mercatusCheckbox = screen.getByRole('checkbox', { name: /^market$/i }) as HTMLInputElement;
+    const harnessCheckbox = screen.getByRole('checkbox', { name: /^harness$/i }) as HTMLInputElement;
+    expect(mercatusCheckbox.checked).toBe(true);
+    expect(harnessCheckbox.checked).toBe(true);
+  });
+
+  it('checking two panels with zero awaits between the clicks (exact reviewer repro) keeps both checked', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^harness$/i }));
+
+    expect(screen.getByTestId('chat-dock-mercatus')).toBeInTheDocument();
+    expect(screen.getByTestId('chat-dock-harness')).toBeInTheDocument();
+
+    const mercatusCheckbox = screen.getByRole('checkbox', { name: /^market$/i }) as HTMLInputElement;
+    const harnessCheckbox = screen.getByRole('checkbox', { name: /^harness$/i }) as HTMLInputElement;
+    expect(mercatusCheckbox.checked).toBe(true);
+    expect(harnessCheckbox.checked).toBe(true);
+  });
+
+  it('closing a panel externally (not via its checkbox) unchecks the corresponding Panels menu checkbox', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^market$/i }));
+    await screen.findByTestId('chat-dock-mercatus');
+    expect(screen.getByRole('checkbox', { name: /^market$/i })).toBeChecked();
+
+    // Close via the real dockview tab-close action (simulates dragging a tab
+    // out / clicking its native close X), not via the Panels checkbox.
+    const tab = screen
+      .getAllByText('Market')
+      .map(el => el.closest('.dv-default-tab'))
+      .find((el): el is HTMLElement => el !== null) as HTMLElement;
+    fireEvent.click(tab.querySelector('.dv-default-tab-action') as HTMLElement);
+    await waitFor(() => expect(screen.queryByTestId('chat-dock-mercatus')).toBeNull());
+
+    expect(screen.getByRole('checkbox', { name: /^market$/i })).not.toBeChecked();
+  });
+
+  it('Approvals panel shows a condensed pending-count badge when docked narrow', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <LanguageProvider>
+        <QueryClientProvider client={client}>
+          <ChatSurface pushToast={vi.fn()} onNavigate={vi.fn()} messages={[]} composer={<div>composer</div>} pendingApprovals={3} />
+        </QueryClientProvider>
+      </LanguageProvider>,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /panels/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^approvals$/i }));
+    const panel = screen.getByTestId('chat-dock-approvals');
+    expect(panel).toHaveTextContent('3 pending');
+    // The full 4-column table must not render — condensed state renders
+    // ApprovalsDockPanel's own summary markup only, never <ApprovalsView>.
+    expect(screen.queryByRole('table')).toBeNull();
+  });
+});
+
+describe('ApprovalsDockPanel width-driven toggle', () => {
+  it('switches to a full-view link, not an inline table, when the toggle mechanism decides it is wide enough', () => {
+    // dockview's own width isn't measurable in jsdom (no real layout engine),
+    // so this test exercises ApprovalsDockPanel directly with a mocked
+    // DockviewPanelApi rather than through the full ChatSurface dock — mirrors
+    // how other width-dependent behavior in this codebase is unit-tested at
+    // the component level when the full dockview integration can't produce
+    // real pixel measurements under jsdom.
+    const mockApi = { width: 900, onDidDimensionsChange: vi.fn(() => ({ dispose: vi.fn() })) } as any;
+    render(
+      <ApprovalsDockPanel
+        api={mockApi}
+        params={{ pendingApprovals: 3, permissionMode: 'Ask', onNavigate: vi.fn() }}
+      />,
+    );
+    expect(screen.getByRole('link', { name: /open full view/i })).toBeInTheDocument();
+  });
+});
+
+describe('MercatusDockPanel width-driven toggle', () => {
+  function StubMercatus({ condensed }: { condensed?: boolean }) {
+    return <div data-testid="mercatus-stub">{condensed ? 'condensed' : 'full'}</div>;
+  }
+
+  it('passes condensed=true to its node below the audited threshold, condensed=false at/above it', () => {
+    let onChange: (() => void) | undefined;
+    const api = {
+      width: 300,
+      onDidDimensionsChange: vi.fn((cb: () => void) => { onChange = cb; return { dispose: vi.fn() }; }),
+    } as any;
+    render(<MercatusDockPanel api={api} params={{ node: <StubMercatus /> }} />);
+    expect(screen.getByTestId('mercatus-stub')).toHaveTextContent('condensed');
+
+    api.width = 340;
+    act(() => onChange?.());
+    expect(screen.getByTestId('mercatus-stub')).toHaveTextContent('full');
+  });
+});
+
+describe('RepositoryDockPanel width-driven toggle', () => {
+  function StubRepository({ condensed }: { condensed?: boolean }) {
+    return <div data-testid="repository-stub">{condensed ? 'condensed' : 'full'}</div>;
+  }
+
+  it('passes condensed=true to its node below the audited threshold, condensed=false at/above it', () => {
+    let onChange: (() => void) | undefined;
+    const api = {
+      width: 200,
+      onDidDimensionsChange: vi.fn((cb: () => void) => { onChange = cb; return { dispose: vi.fn() }; }),
+    } as any;
+    render(<RepositoryDockPanel api={api} params={{ node: <StubRepository /> }} />);
+    expect(screen.getByTestId('repository-stub')).toHaveTextContent('condensed');
+
+    api.width = 280;
+    act(() => onChange?.());
+    expect(screen.getByTestId('repository-stub')).toHaveTextContent('full');
+  });
+});
+
+describe('NeedsYouDockPanel width-driven toggle', () => {
+  function StubNeedsYou({ condensed }: { condensed?: boolean }) {
+    return <div data-testid="needs-you-stub">{condensed ? 'condensed' : 'full'}</div>;
+  }
+
+  it('passes condensed=true to its node below the audited threshold, condensed=false at/above it', () => {
+    let onChange: (() => void) | undefined;
+    const api = {
+      width: 200,
+      onDidDimensionsChange: vi.fn((cb: () => void) => { onChange = cb; return { dispose: vi.fn() }; }),
+    } as any;
+    render(<NeedsYouDockPanel api={api} params={{ node: <StubNeedsYou /> }} />);
+    expect(screen.getByTestId('needs-you-stub')).toHaveTextContent('condensed');
+
+    api.width = 270;
+    act(() => onChange?.());
+    expect(screen.getByTestId('needs-you-stub')).toHaveTextContent('full');
+  });
+});
+
+describe('VoxGraphDockPanel width-driven toggle', () => {
+  function StubVoxGraph({ condensed }: { condensed?: boolean }) {
+    return <div data-testid="voxgraph-stub">{condensed ? 'condensed' : 'full'}</div>;
+  }
+
+  it('passes condensed=true to its node below the audited threshold, condensed=false at/above it', () => {
+    let onChange: (() => void) | undefined;
+    const api = {
+      width: 200,
+      onDidDimensionsChange: vi.fn((cb: () => void) => { onChange = cb; return { dispose: vi.fn() }; }),
+    } as any;
+    render(<VoxGraphDockPanel api={api} params={{ node: <StubVoxGraph /> }} />);
+    expect(screen.getByTestId('voxgraph-stub')).toHaveTextContent('condensed');
+
+    api.width = 240;
+    act(() => onChange?.());
+    expect(screen.getByTestId('voxgraph-stub')).toHaveTextContent('full');
+  });
+});
+
+describe('ActivityDockPanel width-driven toggle', () => {
+  function StubDiscovery({ condensed }: { condensed?: boolean }) {
+    return <div data-testid="activity-stub">{condensed ? 'condensed' : 'full'}</div>;
+  }
+
+  it('passes condensed=true to its node below the audited threshold, condensed=false at/above it', () => {
+    let onChange: (() => void) | undefined;
+    const api = {
+      width: 300,
+      onDidDimensionsChange: vi.fn((cb: () => void) => { onChange = cb; return { dispose: vi.fn() }; }),
+    } as any;
+    render(<ActivityDockPanel api={api} params={{ node: <StubDiscovery /> }} />);
+    expect(screen.getByTestId('activity-stub')).toHaveTextContent('condensed');
+
+    api.width = 360;
+    act(() => onChange?.());
+    expect(screen.getByTestId('activity-stub')).toHaveTextContent('full');
+  });
+});
+
+describe('session hydration ownership (F18: redundant double hydrate per session switch)', () => {
+  it('ChatSurface has no hydrate trigger — App.tsx owns hydration', () => {
+    const surface = readFileSync(resolve(__dirname, './ChatSurface.tsx'), 'utf8');
+    // The redundant effect (`if (activeId && onHydrateSession) onHydrateSession(activeId)`)
+    // and its prop are gone — App's activeSessionId effect is the only trigger.
+    expect(surface).not.toContain('onHydrateSession');
+    const surfaces = readFileSync(resolve(__dirname, '../../layout/surfaceComponents.tsx'), 'utf8');
+    expect(surfaces).not.toContain('onHydrateChatSession');
+    const app = readFileSync(resolve(__dirname, '../../../App.tsx'), 'utf8');
+    expect(app).toContain('hydrateChatSession(activeSessionId)');
+  });
+
+  it('renders humane-session-wrapup-card when attention_budget is exhausted and dismisses cleanly (HUMANE-04)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          messages={[
+            { id: 'u1', role: 'user', text: 'ship it', status: 'done' },
+            { id: 'a1', role: 'assistant', text: 'done', status: 'done' },
+          ]}
+          composer={<div>composer</div>}
+          attention_budget={{
+            spent_ms: 14_400_000,
+            max_attention_ms: 14_400_000,
+            exhausted: true,
+            focus_depth: 2,
+            interrupt_freq_per_hour: 1.5,
+            trust_Factor: 0.9,
+            efficiency_ratio: 0.95,
+            alert_level: 'Critical',
+          }}
+        />
+      </LanguageProvider>,
+    );
+    const card = await screen.findByTestId('humane-session-wrapup-card');
+    expect(card).toHaveTextContent(/Session Wrap-Up — Natural Stopping Point/i);
+    expect(card).toHaveTextContent(/rest days never break your streak/i);
+    fireEvent.click(screen.getByRole('button', { name: /dismiss session wrap-up/i }));
+    expect(screen.queryByTestId('humane-session-wrapup-card')).toBeNull();
+  });
+
+  it('toggles KB Context Inspector drawer (Phase 44) and Batched Attention Inbox Digest panel (Phase 18)', async () => {
+    render(
+      <LanguageProvider>
+        <ChatSurface
+          pushToast={noopToast}
+          activeSessionId="s1"
+          messages={[]}
+          composer={<div data-testid="dummy-composer">Composer</div>}
+        />
+      </LanguageProvider>,
+    );
+
+    const kbToggle = await screen.findByTestId('kb-context-inspector-toggle');
+    fireEvent.click(kbToggle);
+    const drawer = await screen.findByTestId('kb-context-inspector-drawer');
+    expect(drawer).toHaveTextContent(/Session-Pinned @kb Context Injection/i);
+
+    // Edit scope, budget cap, and pinned citations inside @kb Context Inspector
+    fireEvent.click(screen.getByTestId('kb-inspector-scope-verified'));
+    expect(drawer).toHaveTextContent(/Scope: @kb:verified/i);
+
+    fireEvent.click(screen.getByTestId('kb-inspector-pin-edit-ctx-1'));
+    const pinEdit = screen.getByTestId('kb-inspector-pin-edit-input');
+    fireEvent.change(pinEdit, { target: { value: '@kb:layers.toml' } });
+    fireEvent.keyDown(pinEdit, { key: 'Enter' });
+    expect(drawer).toHaveTextContent('@kb:layers.toml');
+
+    const addPin = screen.getByTestId('kb-inspector-add-pin-input');
+    fireEvent.change(addPin, { target: { value: 'docs/src/architecture/telemetry-trust-ssot.md' } });
+    fireEvent.click(screen.getByTestId('kb-inspector-add-pin-btn'));
+    expect(drawer).toHaveTextContent('docs/src/architecture/telemetry-trust-ssot.md');
+
+    const digestToggle = await screen.findByTestId('inbox-digest-toggle');
+    fireEvent.click(digestToggle);
+    expect(await screen.findByTestId('inbox-digest-panel')).toHaveTextContent(
+      /Batched Attention Inbox Digest/i,
+    );
+  });
+});
+
+
+

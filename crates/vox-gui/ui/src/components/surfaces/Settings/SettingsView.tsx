@@ -1,0 +1,1888 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { sanitizeErrorForToast } from '../../../lib/backendGuard';
+import { scrollAndFocusAnchor } from '../../../lib/anchorFocus';
+import { Glass } from '../../ui/Glass';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { Icon } from '../../ui/Icons';
+import { voxTransport } from '../../../transport';
+import type { OrchestratorStatus, RoutingSummary, Toast } from '../../../types/tauri';
+import { DEFAULT_BUDGET_CAP_USD } from '../../../config/budget';
+import { PriorityChainEditor } from './PriorityChainEditor';
+import { TaskPolicySection } from './TaskPolicySection';
+import { HudTilesEditor } from './HudTilesEditor';
+import { applyTheme } from '../../../lib/theme';
+import { getThemeContractHealthReport } from '../../../lib/themeContract';
+import { useLocalStorage } from '../../../hooks/useLocalStorage';
+import { useLang, useLabel } from '../../../hooks/useLanguage';
+import { labelFor } from '../../../lib/lexicon';
+import { useVoxMutation } from '../../../hooks/useVoxQuery';
+import { searchSettings } from './settingsIndex';
+import type { HudTilesConfig } from '../../../hooks/useHudTiles';
+import { recordGamifyGuiEvent } from '../../../lib/gamifyGuiEvents';
+import { ACTION_REGISTRY, DEFAULT_BINDINGS, chordFromEvent } from '../../../lib/keybinds';
+import { setBindings } from '../../../lib/keybindStore';
+import { useKeybindings } from '../../../hooks/useKeybinds';
+import { useOnboardingGate } from '../Onboarding/useOnboardingGate';
+import { useBackendStatus } from '../../../hooks/useBackendStatus';
+import { SurfaceUnavailable } from '../../layout/SurfaceUnavailable';
+import { ServerConnectionSection } from './ServerConnectionSection';
+import { sectionLockedRemotely } from './settingsBackends';
+import { RomanSurfaceHeader } from '../../ui/RomanSurfaceHeader';
+import { decode } from '@msgpack/msgpack';
+
+const GUI_PREF_KEYS = ['theme', 'telemetry', 'sign', 'checkpointMins'] as const;
+
+export const SECTIONS = [
+  { id: 'server',       icon: 'link',    label: 'Server' },
+  { id: 'orchestrator', icon: 'cpu',     label: 'Orchestrator' },
+  { id: 'scaling',      icon: 'cpu',     label: 'Scaling' },
+  { id: 'llm',          icon: 'bolt',    label: 'LLM & providers' },
+  { id: 'routing',      icon: 'matrix',  label: 'Model routing' },
+  { id: 'runtime',      icon: 'flow',    label: 'Runtime' },
+  { id: 'voice',        icon: 'bolt',    label: 'Voice & dictation' },
+  { id: 'mesh',         icon: 'flow',    label: 'Mesh & peers' },
+  { id: 'signing',      icon: 'shield',  label: 'Signing keys' },
+  { id: 'secrets',      icon: 'shield',  label: 'Keys & Secrets' },
+  { id: 'telemetry',    icon: 'scale',   label: 'Telemetry' },
+  { id: 'onboarding',   icon: 'refresh', label: 'Onboarding' },
+  { id: 'keybinds',     icon: 'command', label: 'Keybinds' },
+  { id: 'theme',        icon: 'spark',   label: 'Theme' },
+  { id: 'display',      icon: 'monitor', label: 'Display' },
+  { id: 'gamify',       icon: 'bolt',    label: 'Gamification' },
+];
+
+
+interface SettingsState {
+  doubt: boolean;
+  autobudget: boolean;
+  chatResearchEnabled: boolean;
+  theme: string;
+  concurrency: number;
+  capUsd: number;
+  doubtThresh: number;
+  sign: boolean;
+  telemetry: string;
+  isolation: string;
+  checkpointMins: number;
+  scalingEnabled: boolean;
+  harnessIssueDetectionEnabled: boolean;
+  minAgents: number;
+  scalingThreshold: number;
+  scaleCpuCeilingPct: number;
+  scaleMemFloorMb: number;
+}
+
+/** The label of the enclosing Row, so a control inside it is named without every call site repeating it. */
+const RowLabelContext = React.createContext<string | undefined>(undefined);
+
+function Row({ label, hint, children }: { label: string; hint: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-xl border border-border-subtle bg-overlay-subtle p-3">
+      <div>
+        <div className="font-display text-[12px] text-text-secondary">{label}</div>
+        <div className="text-[11px] text-text-muted">{hint}</div>
+      </div>
+      <RowLabelContext.Provider value={label}>
+        <div className="shrink-0">{children}</div>
+      </RowLabelContext.Provider>
+    </div>
+  );
+}
+
+function Toggle({ on, onClick, 'data-testid': testId }: { on: boolean; onClick: () => void; 'data-testid'?: string }) {
+  return (
+    <button
+      type="button"
+      data-testid={testId}
+      aria-label={on ? 'Toggle on' : 'Toggle off'}
+      aria-pressed={on}
+      onClick={onClick}
+      className={`relative h-5 w-9 rounded-full border transition ${
+        on
+          ? 'border-[#1B6B3A] bg-linear-to-r from-[#1E7E46] to-[#156336]'
+          : 'border-border-strong bg-bg-elevated'
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 size-3.5 rounded-full border transition ${
+          on
+            ? 'left-[18px] border-[#9A7014] bg-linear-to-b from-[#FFF8E7] to-[#DFC878] shadow-xs'
+            : 'left-0.5 border-border-strong bg-bg-surface'
+        }`}
+      />
+    </button>
+  );
+}
+
+function RangeInline({
+  value, min, max, step = 1, prefix = '', suffix = '', onChange,
+}: {
+  value: number; min: number; max: number; step?: number; prefix?: string; suffix?: string; onChange: (v: number) => void;
+}) {
+  const label = React.useContext(RowLabelContext);
+  const pct = ((value - min) / (max - min)) * 100;
+  return (
+    <div className="flex w-52 items-center gap-3">
+      <input
+        type="range" aria-label={label} min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        className="vox-range flex-1 h-1.5 appearance-none rounded-full overflow-hidden border border-border-subtle"
+        style={{ background: `linear-gradient(to right, rgb(var(--brass)) ${pct}%, var(--color-overlay-hover) ${pct}%)` } as any}
+      />
+      <span className="w-14 text-right font-mono text-[11px] font-semibold text-text-secondary">{prefix}{value}{suffix}</span>
+    </div>
+  );
+}
+
+/** One node row as summarized by the `vox_mesh_nodes` MCP tool (mirrors MeshView). */
+interface MeshNode {
+  id: string;
+  status: string;
+  host_triple?: string | null;
+  gpu_summary?: string | null;
+  trust_tier?: string | null;
+  ed25519_pub_key_b64?: string | null;
+  advertised_models?: string[];
+  cpu_usage_pct?: number | null;
+  memory_free_bytes?: number | null;
+  gpu_total_count?: number | null;
+  gpu_allocatable_count?: number | null;
+}
+
+/** Aggregate the node list into the at-a-glance resource summary (client-side
+ * mirror of the populi /v1/populi/resources/summary endpoint). */
+function aggregateMeshResources(nodes: MeshNode[]) {
+  const ready = nodes.filter(n => n.status === 'online');
+  const gpusFree = ready.reduce((s, n) => s + (n.gpu_allocatable_count ?? 0), 0);
+  const ramFreeGib = ready.reduce((s, n) => s + (n.memory_free_bytes ?? 0), 0) / 2 ** 30;
+  const cpuVals = ready.map(n => n.cpu_usage_pct).filter((c): c is number => typeof c === 'number');
+  const cpuAvg = cpuVals.length ? cpuVals.reduce((a, b) => a + b, 0) / cpuVals.length : 0;
+  return { readyCount: ready.length, total: nodes.length, gpusFree, ramFreeGib, cpuAvg, hasMetrics: cpuVals.length > 0 || gpusFree > 0 || ramFreeGib > 0 };
+}
+
+interface MeshNodesResult {
+  source?: string;
+  control_plane_error?: string;
+  nodes?: MeshNode[];
+}
+
+interface McpEnvelope<T> {
+  tool: string;
+  is_error: boolean;
+  result: T;
+}
+
+/** Locally-trusted peer, mirrors Rust `TrustedNodeDto`. */
+interface TrustedNodeDto {
+  nodeId: string;
+  pubkeyHex: string;
+  label: string | null;
+  addedAt: string;
+}
+
+/** Live signing identity, mirrors Rust `SigningKeyDto`. */
+interface SigningKeyDto {
+  nodeId: string;
+  algorithm: string;
+  fingerprint: string;
+  pubkeyHex: string;
+  present: boolean;
+}
+
+function MeshPeersSection({ pushToast }: { pushToast: (t: Toast) => void }) {
+  const [nodes, setNodes] = useState<MeshNode[]>([]);
+  const [meta, setMeta] = useState<MeshNodesResult>({});
+  const [trusted, setTrusted] = useState<Record<string, TrustedNodeDto>>({});
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const [nodesRes, trustedList] = await Promise.all([
+        invoke<McpEnvelope<MeshNodesResult>>('invoke_mcp_tool', { tool: 'vox_mesh_nodes', args: {} }),
+        invoke<TrustedNodeDto[]>('list_trusted_nodes'),
+      ]);
+      const m = nodesRes?.result ?? {};
+      setMeta(m);
+      setNodes(Array.isArray(m.nodes) ? m.nodes : []);
+      const map: Record<string, TrustedNodeDto> = {};
+      for (const t of trustedList) map[t.nodeId] = t;
+      setTrusted(map);
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Mesh load failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setLoading(false);
+    }
+  }, [pushToast]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const toggleTrust = async (n: MeshNode) => {
+    const isTrusted = !!trusted[n.id];
+    setBusy(n.id);
+    try {
+      if (isTrusted) {
+        await invoke<boolean>('untrust_mesh_node', { nodeId: n.id });
+        pushToast({ tone: 'ok', title: 'Peer untrusted', body: n.id, cause: 'backend-ok' });
+      } else {
+        await invoke<boolean>('trust_mesh_node', {
+          nodeId: n.id,
+          pubkeyHex: n.ed25519_pub_key_b64 ?? '',
+          label: n.host_triple ?? null,
+        });
+        pushToast({ tone: 'ok', title: 'Peer trusted', body: n.id, cause: 'backend-ok' });
+      }
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Trust update failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-mesh-peers')}</h2>
+      <p className="mt-0.5 text-[11px] text-text-muted">Discover and authorise peer compute on the local mesh (source: {meta.source ?? '—'})</p>
+      {meta.control_plane_error && (
+        <div className="mt-3 rounded-md border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-300">
+          Control plane unreachable — showing local registry. <span className="font-mono">{meta.control_plane_error}</span>
+        </div>
+      )}
+      {loading ? (
+        <div className="mt-4 text-[12px] text-text-muted">Loading peers…</div>
+      ) : nodes.length === 0 ? (
+        <div className="mt-4 rounded-md border border-border-subtle bg-overlay-subtle p-4 text-[11px] leading-relaxed text-text-muted">
+          No mesh peers. Join one with <code className="font-mono text-text-muted">vox populi join</code>, or configure a control plane via{' '}
+          <code className="font-mono text-text-muted">VOX_ORCHESTRATOR_MESH_CONTROL_URL</code>.
+        </div>
+      ) : (
+        <div className="mt-4 space-y-2">
+          {(() => {
+            const r = aggregateMeshResources(nodes);
+            if (!r.hasMetrics) return null;
+            return (
+              <div className="grid grid-cols-4 gap-2 rounded-lg border border-border-subtle bg-overlay-subtle p-3 text-center">
+                <div><div className="text-[18px] text-text-primary">{r.readyCount}/{r.total}</div><div className="text-[9px] uppercase tracking-widest text-text-muted">nodes ready</div></div>
+                <div><div className="text-[18px] text-text-primary">{r.gpusFree}</div><div className="text-[9px] uppercase tracking-widest text-text-muted">GPUs free</div></div>
+                <div><div className="text-[18px] text-text-primary">{r.ramFreeGib.toFixed(0)} GiB</div><div className="text-[9px] uppercase tracking-widest text-text-muted">RAM free</div></div>
+                <div><div className="text-[18px] text-text-primary">{r.cpuAvg.toFixed(0)}%</div><div className="text-[9px] uppercase tracking-widest text-text-muted">avg CPU</div></div>
+              </div>
+            );
+          })()}
+          {nodes.map(p => {
+            const isTrusted = !!trusted[p.id];
+            const online = p.status === 'online';
+            return (
+              <div key={p.id} className="flex items-center justify-between rounded-md border border-border-subtle bg-overlay-subtle p-3">
+                <div className="flex items-center gap-3">
+                  <span className={`size-2 rounded-full ${online ? 'bg-[#7B8C32]' : 'bg-text-muted'}`} />
+                  <div className="leading-tight">
+                    <div className="font-mono text-[12px] text-text-primary break-all">{p.id}</div>
+                    <div className="font-mono text-[10px] text-text-muted">{(p.host_triple ?? '—')} · {(p.gpu_summary ?? '—')}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`rounded-full px-2 py-0.5 font-display text-[9px] uppercase tracking-widest ${
+                    isTrusted ? 'bg-[#5B6B24]/25 text-[#DCE7B6]' : 'bg-bg-elevated/40 text-text-muted'
+                  }`}>{isTrusted ? 'trusted' : (p.trust_tier ?? 'untrusted')}</span>
+                  <button
+                    type="button"
+                    disabled={busy === p.id}
+                    onClick={() => toggleTrust(p)}
+                    className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+                  >{isTrusted ? 'untrust' : 'trust'}</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+}
+
+function SigningKeysSection({ vals, update, pushToast, gamifyEnabled }: {
+  vals: SettingsState; update: (patch: Partial<SettingsState>) => void; pushToast: (t: Toast) => void;
+  gamifyEnabled?: boolean;
+}) {
+  const [key, setKey] = useState<SigningKeyDto | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [rotating, setRotating] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      setKey(await invoke<SigningKeyDto>('signing_key_status'));
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Could not load signing key', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setLoading(false);
+    }
+  }, [pushToast]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const rotate = async () => {
+    const present = key?.present;
+    const verb = present ? 'rotate' : 'create';
+    const prompt = present
+      ? 'Rotate signing key? Enter master password to confirm. This generates a NEW ed25519 keypair; peers trusting the old key must re-trust.'
+      : 'Create node identity? Choose a master password to encrypt the new ed25519 key.';
+    // eslint-disable-next-line no-alert -- interactive master password prompt for key rotation
+    const password = window.prompt(prompt) ?? '';
+    if (!password) return;
+    setRotating(true);
+    try {
+      const next = await invoke<SigningKeyDto>('rotate_signing_key', { password });
+      setKey(next);
+      pushToast({ tone: 'ok', title: `Key ${verb}d`, body: next.nodeId || next.fingerprint, cause: 'backend-ok' });
+      if (present) {
+        void recordGamifyGuiEvent(
+          'signing_key_rotated',
+          { node_id: next.nodeId, fingerprint: next.fingerprint },
+          { enabled: gamifyEnabled },
+        );
+      }
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: `Key ${verb} failed`, body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setRotating(false);
+    }
+  };
+
+  return (
+    <>
+      <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-signing')}</h2>
+      <p className="mt-0.5 text-[11px] text-text-muted">ed25519 capability gate for high-risk dispatch (local node identity)</p>
+      <div className="mt-4 space-y-2">
+        {loading ? (
+          <div className="text-[12px] text-text-muted">Loading…</div>
+        ) : !key?.present ? (
+          <div className="rounded-md border border-border-subtle bg-overlay-subtle p-4">
+            <div className="text-[11px] text-text-muted">No local node identity yet. Create one to enable signed dispatch.</div>
+            <button
+              type="button"
+              disabled={rotating}
+              onClick={rotate}
+              className="mt-3 rounded-sm border border-border-subtle bg-overlay-subtle px-3 py-1.5 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+            >{rotating ? 'working…' : 'create identity'}</button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between rounded-md border border-border-subtle bg-overlay-subtle p-3">
+            <div className="flex items-center gap-3">
+              <Icon.shield className="size-4 text-amber-300" />
+              <div className="leading-tight">
+                <div className="font-mono text-[12px] text-text-primary">{key.nodeId || '(locked)'}</div>
+                <div className="font-mono text-[10px] text-text-muted">{key.fingerprint}</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="rounded-full bg-overlay-subtle px-2 py-0.5 font-display text-[9px] uppercase tracking-widest text-text-secondary">{key.algorithm}</span>
+              <button
+                type="button"
+                disabled={rotating}
+                onClick={rotate}
+                className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+              >{rotating ? 'rotating…' : 'rotate'}</button>
+            </div>
+          </div>
+        )}
+        <Row label="Require signature on Native isolation" hint="Hard gate; refuses dispatch without ed25519">
+          <Toggle on={vals.sign} onClick={() => update({ sign: !vals.sign })} />
+        </Row>
+      </div>
+    </>
+  );
+}
+
+// Redaction-safe DTO mirroring the Rust `SecretStatusDto`. NOTE: there is no
+// field carrying the raw secret value — the backend never returns it.
+interface SecretStatusDto {
+  id: string;
+  canonicalEnv: string;
+  scopeDescription: string;
+  taxonomySlug: string;
+  authRegistry: string | null;
+  required: boolean;
+  isPresent: boolean;
+  status: string;
+  redacted: string;
+  source: string | null;
+  remediation: string;
+}
+
+// Backend/profile status header DTO, mirrors Rust `SecretsBackendStatusDto`.
+interface SecretsBackendStatusDto {
+  backendMode: string;
+  profile: string;
+  strict: boolean;
+  available: boolean;
+  detail: string | null;
+}
+
+// One recognised key from an `.env` import preview. NAMES + redacted only — no values.
+interface ImportEnvEntryDto {
+  sourceKey: string;
+  canonicalEnv: string;
+  redacted: string;
+}
+
+interface ImportEnvResultDto {
+  applied: boolean;
+  count: number;
+  entries: ImportEnvEntryDto[];
+}
+
+export function KeysSecretsSection({ pushToast, gamifyEnabled }: { pushToast: (t: Toast) => void; gamifyEnabled?: boolean }) {
+  const [rows, setRows] = useState<SecretStatusDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  // Holds ONLY the in-flight input value per key. Cleared immediately on save.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [status, setStatus] = useState<SecretsBackendStatusDto | null>(null);
+
+  // Per-taxonomy collapse state, persisted (mirrors the Sidebar pattern).
+  const [collapsed, setCollapsed] = useLocalStorage<Record<string, boolean>>('vox_secrets_groups', {});
+  // Tracks which slugs we've already applied the auto-expand default to, so a
+  // user's later manual collapse of a required group is never re-overridden.
+  const seededSlugs = useRef<Set<string>>(new Set());
+
+  // Inline Import .env flow state.
+  const [envPath, setEnvPath] = useState('');
+  const [preview, setPreview] = useState<ImportEnvResultDto | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+
+  const reload = async () => {
+    try {
+      const [next, st] = await Promise.all([
+        invoke<SecretStatusDto[]>('list_secret_status'),
+        invoke<SecretsBackendStatusDto>('secrets_backend_status').catch(() => null),
+      ]);
+      setRows(next);
+      if (st) setStatus(st);
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Could not load secrets', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { reload(); }, []);
+
+  // Group rows by taxonomy slug (stable insertion order from the backend list).
+  const groups = React.useMemo(() => {
+    const map = new Map<string, SecretStatusDto[]>();
+    for (const r of rows) {
+      const slug = r.taxonomySlug || 'other';
+      (map.get(slug) ?? map.set(slug, []).get(slug)!).push(r);
+    }
+    return Array.from(map.entries()).map(([slug, items]) => {
+      const set = items.filter(i => i.isPresent).length;
+      const missing = items.length - set;
+      const needsAttention = items.some(i => i.required && !i.isPresent);
+      return { slug, items, set, missing, needsAttention };
+    });
+  }, [rows]);
+
+  // Default: groups with an unmet required secret start expanded; others stay as
+  // stored (or collapsed on first sight). Only seed each slug once.
+  useEffect(() => {
+    if (groups.length === 0) return;
+    const focusKey = localStorage.getItem('vox_focus_secret_key');
+    setCollapsed(prev => {
+      const next = { ...prev };
+      let changed = false;
+      for (const g of groups) {
+        const hasFocusKey = focusKey ? g.items.some(i => i.canonicalEnv === focusKey) : false;
+        if (hasFocusKey && next[g.slug] !== false) {
+          next[g.slug] = false;
+          changed = true;
+        }
+        if (seededSlugs.current.has(g.slug)) continue;
+        seededSlugs.current.add(g.slug);
+        if (!(g.slug in next)) {
+          next[g.slug] = hasFocusKey ? false : !g.needsAttention;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    if (focusKey) {
+      localStorage.removeItem('vox_focus_secret_key');
+      setTimeout(() => {
+        scrollAndFocusAnchor(`secret-row-${focusKey}`);
+      }, 60);
+    }
+  }, [groups, setCollapsed]);
+
+  const toggleGroup = (slug: string) =>
+    setCollapsed(prev => ({ ...prev, [slug]: !prev[slug] }));
+
+  const migrate = async () => {
+    setImportBusy(true);
+    try {
+      const moved = await invoke<number>('migrate_auth_store');
+      pushToast({ tone: 'ok', title: 'Auth store migrated', body: `${moved} entr${moved === 1 ? 'y' : 'ies'} moved to vault`, cause: 'backend-ok' });
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Migrate failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const runPreview = async () => {
+    setImportBusy(true);
+    try {
+      const res = await invoke<ImportEnvResultDto>('import_env', { path: envPath || null, apply: false });
+      setPreview(res);
+      if (res.count === 0) {
+        pushToast({ tone: 'warn', title: 'No managed secrets found', body: envPath || '.env', cause: 'validation' });
+      }
+    } catch (err) {
+      setPreview(null);
+      pushToast({ tone: 'warn', title: 'Preview failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const runImport = async () => {
+    setImportBusy(true);
+    try {
+      const res = await invoke<ImportEnvResultDto>('import_env', { path: envPath || null, apply: true });
+      setPreview(null);
+      pushToast({ tone: 'ok', title: 'Secrets imported', body: `${res.count} value${res.count === 1 ? '' : 's'} stored in vault`, cause: 'backend-ok' });
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Import failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const save = async (key: string) => {
+    const value = drafts[key];
+    if (!value) return;
+    setBusy(key);
+    try {
+      await invoke<boolean>('set_secret', { key, value });
+      // Clear the field immediately — the value never lives in UI state beyond this.
+      setDrafts(d => { const n = { ...d }; delete n[key]; return n; });
+      pushToast({ tone: 'ok', title: 'Secret saved', body: key, cause: 'backend-ok' });
+      void recordGamifyGuiEvent('secret_rotated', { key }, { enabled: gamifyEnabled });
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (key: string) => {
+    setBusy(key);
+    try {
+      await invoke<boolean>('remove_secret', { key });
+      pushToast({ tone: 'ok', title: 'Secret removed', body: key, cause: 'backend-ok' });
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Remove failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const renderSecretRow = (r: SecretStatusDto) => (
+    <div key={r.id} id={`secret-row-${r.canonicalEnv}`} data-testid={`secret-row-${r.canonicalEnv}`} className="rounded-md border border-border-subtle bg-overlay-subtle p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="leading-tight">
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[12px] text-text-primary">{r.canonicalEnv}</span>
+            {r.required && (
+              <span className="rounded-full bg-amber-400/15 px-2 py-0.5 font-display text-[9px] uppercase tracking-widest text-amber-300">required</span>
+            )}
+          </div>
+          <div className="mt-0.5 text-[10px] text-text-muted">{r.scopeDescription}</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className={`rounded-full px-2 py-0.5 font-display text-[9px] uppercase tracking-widest ${
+            r.isPresent ? 'bg-emerald-400/15 text-emerald-300' : 'bg-bg-elevated/40 text-text-muted'
+          }`}>{r.isPresent ? 'set' : 'missing'}</span>
+          {r.isPresent && (
+            <span className="font-mono text-[10px] text-text-muted">{r.redacted}</span>
+          )}
+        </div>
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <input
+          type="password"
+          autoComplete="new-password"
+          placeholder="Paste new value…"
+          value={drafts[r.canonicalEnv] ?? ''}
+          onChange={e => setDrafts(d => ({ ...d, [r.canonicalEnv]: e.target.value }))}
+          className="flex-1 rounded-sm border border-border-subtle bg-black/30 px-2 py-1 font-mono text-[11px] text-text-primary placeholder:text-text-muted focus:border-brass/40 focus:outline-hidden"
+        />
+        <button
+          type="button"
+          disabled={!drafts[r.canonicalEnv] || busy === r.canonicalEnv}
+          onClick={() => save(r.canonicalEnv)}
+          className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+        >save</button>
+        <button
+          type="button"
+          disabled={!r.isPresent || busy === r.canonicalEnv}
+          onClick={() => remove(r.canonicalEnv)}
+          className="rounded-sm border border-rose-500/20 bg-rose-500/4 px-2 py-1 font-mono text-[10px] text-rose-300 hover:bg-rose-500/10 disabled:opacity-40"
+        >remove</button>
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-secrets')}</h2>
+        {status && (
+          <>
+            <span className="rounded-full bg-overlay-subtle px-2 py-0.5 font-display text-[9px] uppercase tracking-widest text-text-secondary" title="Active secrets backend mode">
+              backend: {status.backendMode}
+            </span>
+            <span className={`rounded-full px-2 py-0.5 font-display text-[9px] uppercase tracking-widest ${
+              status.strict ? 'bg-amber-400/15 text-amber-300' : 'bg-overlay-subtle text-text-secondary'
+            }`} title="Active resolution profile">
+              profile: {status.profile}
+            </span>
+            <span className={`rounded-full px-2 py-0.5 font-display text-[9px] uppercase tracking-widest ${
+              status.available ? 'bg-emerald-400/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'
+            }`} title={status.detail ?? undefined}>
+              {status.available ? 'available' : 'unavailable'}
+            </span>
+          </>
+        )}
+      </div>
+      <p className="mt-0.5 text-[11px] text-text-muted">
+        Managed API keys and tokens (Vox Secrets / Clavis). Values are write-only — once saved they are never shown again, only a redacted preview.
+      </p>
+
+      {/* Actions: migrate auth.json + import .env */}
+      <div className="mt-4 rounded-md border border-border-subtle bg-overlay-subtle p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={importBusy}
+            onClick={migrate}
+            className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+          >Migrate auth.json → vault</button>
+          <input
+            type="text"
+            value={envPath}
+            placeholder="default .env (optional path)"
+            onChange={e => { setEnvPath(e.target.value); setPreview(null); }}
+            className="min-w-[180px] flex-1 rounded-sm border border-border-subtle bg-black/30 px-2 py-1 font-mono text-[11px] text-text-primary placeholder:text-text-muted focus:border-brass/40 focus:outline-hidden"
+          />
+          <button
+            type="button"
+            disabled={importBusy}
+            onClick={runPreview}
+            className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+          >Preview</button>
+          {preview && preview.count > 0 && (
+            <button
+              type="button"
+              disabled={importBusy}
+              onClick={runImport}
+              className="rounded-sm border border-emerald-400/20 bg-emerald-400/6 px-2 py-1 font-mono text-[10px] text-emerald-300 hover:bg-emerald-400/10 disabled:opacity-40"
+            >Import {preview.count}</button>
+          )}
+        </div>
+        {preview && (
+          <div className="mt-2 rounded-sm border border-border-subtle bg-black/20 p-2">
+            <div className="font-display text-[10px] uppercase tracking-widest text-text-muted">
+              {preview.count} managed secret{preview.count === 1 ? '' : 's'} would import (names only — no values shown)
+            </div>
+            {preview.entries.length > 0 && (
+              <div className="mt-1 flex flex-col gap-0.5">
+                {preview.entries.map(e => (
+                  <div key={e.sourceKey} className="flex items-center gap-2 font-mono text-[10px] text-text-muted">
+                    <span className="text-text-secondary">{e.sourceKey}</span>
+                    <span className="text-text-muted">→</span>
+                    <span className="text-text-secondary">{e.canonicalEnv}</span>
+                    <span className="text-text-muted">{e.redacted}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="mt-4 text-[12px] text-text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 space-y-2">
+          {groups.map(g => {
+            const isCollapsed = !!collapsed[g.slug];
+            return (
+              <div key={g.slug} className="rounded-md border border-border-subtle bg-overlay-subtle">
+                <button
+                  type="button"
+                  onClick={() => toggleGroup(g.slug)}
+                  className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-overlay-subtle"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] text-text-muted">{isCollapsed ? '▸' : '▾'}</span>
+                    <span className="rounded-full bg-overlay-subtle px-2 py-0.5 font-display text-[9px] uppercase tracking-widest text-text-secondary">{g.slug}</span>
+                    {g.needsAttention && (
+                      <span className="rounded-full bg-amber-400/15 px-2 py-0.5 font-display text-[9px] uppercase tracking-widest text-amber-300">action needed</span>
+                    )}
+                  </div>
+                  <span className="font-mono text-[10px] text-text-muted">
+                    {g.set} set / {g.missing} missing
+                  </span>
+                </button>
+                {!isCollapsed && (
+                  <div className="space-y-2 px-2 pb-2">
+                    {g.items.map(renderSecretRow)}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** Editable runtime config field, mirrors Rust `UserConfigFieldDto`. */
+interface UserConfigFieldDto {
+  key: string;
+  label: string;
+  hint: string;
+  group: string;
+  kind: 'string' | 'float' | 'int' | 'path' | 'enum';
+  options: string[];
+  default: string;
+  currentValue: string;
+}
+
+const RUNTIME_GROUP_ORDER = ['General', 'Models & endpoints', 'Tuning', 'Training'];
+
+/** Recorded LLM spend vs budget caps, mirrors Rust `LlmSpendDto`. */
+interface LlmSpendDto {
+  sessionUsd: number;
+  dayUsd: number;
+  totalUsd: number;
+  dailyBudgetUsd: number;
+  perSessionBudgetUsd: number;
+}
+
+/**
+ * Recorded spend vs budget from the connected Vox server (single SSOT aggregate). Best-effort:
+ * stays hidden when the read fails. Shown inside Runtime locally, and on its own remotely, where
+ * Runtime's config editor is locked to this machine but the spend is the server's.
+ */
+function LlmSpendMeter() {
+  const [spend, setSpend] = useState<LlmSpendDto | null>(null);
+  const reload = useCallback(async () => {
+    try {
+      setSpend(await invoke<LlmSpendDto>('get_llm_spend', {}));
+    } catch {
+      setSpend(null);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    // Guarded: listen() rejects outside Tauri (bare browser/tests).
+    const un = listen('vox://llm-config-changed', () => { reload(); }).catch(() => undefined);
+    return () => { un.then((f) => f?.()); };
+  }, [reload]);
+  if (!spend) return null;
+  return (
+    <div className="mt-3 rounded-sm border border-border-subtle bg-black/20 p-3" data-testid="llm-spend">
+      <div className="font-mono text-[10px] uppercase tracking-wide text-text-muted">LLM spend (recorded actuals)</div>
+      <div className="mt-1 flex flex-wrap gap-x-6 gap-y-1 font-mono text-[11px] text-text-secondary">
+        <span>session ${spend.sessionUsd.toFixed(4)} / ${spend.perSessionBudgetUsd.toFixed(2)}</span>
+        <span>today ${spend.dayUsd.toFixed(4)} / ${spend.dailyBudgetUsd.toFixed(2)}</span>
+        <span>total ${spend.totalUsd.toFixed(4)}</span>
+      </div>
+    </div>
+  );
+}
+
+function RuntimeConfigSection({ pushToast }: { pushToast: (t: Toast) => void }) {
+  const [fields, setFields] = useState<UserConfigFieldDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  // In-flight edits keyed by config key; cleared on reload.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const savedToast = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const next = await invoke<UserConfigFieldDto[]>('get_user_config');
+      setFields(next);
+      setDrafts({});
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Could not load runtime config', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setLoading(false);
+    }
+  }, [pushToast]);
+
+  useEffect(() => { reload(); }, [reload]);
+  // Reactive refresh: the backend emits "vox://llm-config-changed" whenever config
+  // changes (this GUI, env reload, or mesh sync). Re-pull the catalog on each event.
+  useEffect(() => {
+    // Guarded: listen() rejects outside Tauri (bare browser/tests).
+    const un = listen('vox://llm-config-changed', () => { reload(); }).catch(() => undefined);
+    return () => { un.then((f) => f?.()); };
+  }, [reload]);
+  useEffect(() => () => { if (savedToast.current) clearTimeout(savedToast.current); }, []);
+
+  const save = async (f: UserConfigFieldDto, value: string) => {
+    setBusy(f.key);
+    try {
+      await invoke('set_user_config', { key: f.key, value });
+      if (savedToast.current) clearTimeout(savedToast.current);
+      savedToast.current = setTimeout(() => {
+        pushToast({ tone: 'ok', title: 'Setting saved', body: f.label, cause: 'backend-ok' });
+      }, 600);
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const reset = async (f: UserConfigFieldDto) => {
+    setBusy(f.key);
+    try {
+      await invoke('reset_user_config', { key: f.key });
+      pushToast({ tone: 'ok', title: 'Reset to default', body: f.label, cause: 'backend-ok' });
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Reset failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const draftFor = (f: UserConfigFieldDto) => drafts[f.key] ?? f.currentValue;
+
+  const control = (f: UserConfigFieldDto) => {
+    if (f.kind === 'enum') {
+      return (
+        <div className="inline-flex flex-wrap items-center rounded-md border border-border-subtle bg-black/30 p-0.5">
+          {f.options.map(opt => (
+            <button
+              key={opt}
+              type="button"
+              disabled={busy === f.key}
+              onClick={() => save(f, opt)}
+              className={`rounded-[5px] px-2 py-1 font-display text-[10px] uppercase tracking-[0.12em] transition disabled:opacity-40 ${
+                f.currentValue === opt ? 'bg-overlay-subtle text-text-primary' : 'text-text-muted hover:text-text-secondary'
+              }`}
+            >{opt}</button>
+          ))}
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          inputMode={f.kind === 'float' || f.kind === 'int' ? 'numeric' : 'text'}
+          value={draftFor(f)}
+          placeholder={f.default || '—'}
+          onChange={e => setDrafts(d => ({ ...d, [f.key]: e.target.value }))}
+          className="w-56 rounded-sm border border-border-subtle bg-black/30 px-2 py-1 font-mono text-[11px] text-text-primary placeholder:text-text-muted focus:border-brass/40 focus:outline-hidden"
+        />
+        <button
+          type="button"
+          disabled={busy === f.key || draftFor(f) === f.currentValue}
+          onClick={() => save(f, draftFor(f))}
+          className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-secondary hover:bg-overlay-subtle disabled:opacity-40"
+        >save</button>
+      </div>
+    );
+  };
+
+  const groups = RUNTIME_GROUP_ORDER
+    .map(g => ({ group: g, items: fields.filter(f => f.group === g) }))
+    .filter(g => g.items.length > 0);
+
+  return (
+    <>
+      <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-runtime')}</h2>
+      <p className="mt-0.5 text-[11px] text-text-muted">
+        Core user config persisted to your Vox user config (effective values: ENV &gt; Vox.toml &gt; global &gt; defaults)
+      </p>
+      <LlmSpendMeter />
+      {loading ? (
+        <div className="mt-4 text-[12px] text-text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 space-y-5">
+          {groups.map(({ group, items }) => (
+            <div key={group}>
+              <div className="font-display text-[11px] uppercase tracking-[0.15em] text-text-muted">{group}</div>
+              <div className="mt-2 space-y-2">
+                {items.map(f => (
+                  <Row key={f.key} label={f.label} hint={f.hint}>
+                    <div className="flex items-center gap-2">
+                      {control(f)}
+                      <button
+                        type="button"
+                        disabled={busy === f.key}
+                        onClick={() => reset(f)}
+                        title="Reset to default"
+                        className="rounded-sm border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[10px] text-text-muted hover:bg-overlay-subtle disabled:opacity-40"
+                      >reset</button>
+                    </div>
+                  </Row>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function LlmSettingsSection({ pushToast, onJumpToKeysSecrets }: { pushToast: (t: Toast) => void; onJumpToKeysSecrets: () => void }) {
+  const [cfg, setCfg] = useState({
+    maxConcurrentRequests: 8,
+    openrouterMaxConcurrent: null as number | null,
+    retryMaxAttempts: 4,
+  });
+  const [keyConfigured, setKeyConfigured] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const c = await invoke<Record<string, unknown>>('get_llm_config');
+        setCfg({
+          maxConcurrentRequests: Number(c.max_concurrent_requests ?? 8),
+          openrouterMaxConcurrent:
+            c.openrouter_max_concurrent == null ? null : Number(c.openrouter_max_concurrent),
+          retryMaxAttempts: Number(c.retry_max_attempts ?? 4),
+        });
+      } catch { /* defaults */ }
+      try {
+        const s = await invoke<{ configured: boolean }>('openrouter_key_status');
+        setKeyConfigured(s.configured);
+      } catch { /* probe best-effort */ }
+    })();
+  }, []);
+
+  const save = (next: typeof cfg) => {
+    setCfg(next);
+    invoke('set_llm_config', {
+      config: {
+        maxConcurrentRequests: next.maxConcurrentRequests,
+        openrouterMaxConcurrent: next.openrouterMaxConcurrent,
+        retryMaxAttempts: next.retryMaxAttempts,
+      },
+    }).catch((err) => pushToast({ tone: 'warn', title: 'LLM save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' }));
+  };
+
+  return (
+    <>
+      <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-llm')}</h2>
+      <p className="mt-0.5 text-[11px] text-text-muted">Concurrency throttle for LLM egress. OpenRouter paid tier has no platform request cap, so parallelism is the real dial.</p>
+      <div className="mt-4 space-y-3">
+        <Row label="Max parallel LLM requests" hint="Global ceiling across all providers (AIMD throttle)">
+          <RangeInline value={cfg.maxConcurrentRequests} min={1} max={64} onChange={v => save({ ...cfg, maxConcurrentRequests: v })} />
+        </Row>
+        <Row label="OpenRouter override" hint="Provider-specific cap (0 = use global)">
+          <RangeInline value={cfg.openrouterMaxConcurrent ?? 0} min={0} max={64} onChange={v => save({ ...cfg, openrouterMaxConcurrent: v === 0 ? null : v })} />
+        </Row>
+        <Row label="429 retry attempts" hint="Backoff retries before surfacing a rate-limit error">
+          <RangeInline value={cfg.retryMaxAttempts} min={0} max={10} onChange={v => save({ ...cfg, retryMaxAttempts: v })} />
+        </Row>
+      </div>
+      {keyConfigured !== null && (
+        <div className="mt-4 rounded-lg border border-border-subtle bg-overlay-subtle px-3 py-2 text-[11px] text-text-muted">
+          {keyConfigured ? (
+            'OpenRouter API key is configured.'
+          ) : (
+            <>
+              No OpenRouter key configured —{' '}
+              <button
+                type="button"
+                onClick={onJumpToKeysSecrets}
+                className="text-brass underline hover:no-underline"
+              >
+                add one under Keys & Secrets
+              </button>
+              .
+            </>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function OnboardingSection() {
+  // This section only ever calls `.replay()`, a pure `setDismissed(false)` — the
+  // dummy input values deliberately produce `shouldShow: false` from this call site.
+  const gate = useOnboardingGate({ secretCount: 1, localModelCount: 0 });
+  return (
+    <>
+      <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">Onboarding</h2>
+      <p className="mt-0.5 text-[11px] text-text-muted">Replay the first-run setup wizard.</p>
+      <button
+        type="button"
+        onClick={gate.replay}
+        className="mt-3 rounded-lg border border-border-subtle px-3 py-1.5 text-[11px] hover:bg-overlay-subtle"
+      >
+        Replay setup wizard
+      </button>
+    </>
+  );
+}
+
+interface SttConfigFieldDto {
+  key: string;
+  label: string;
+  hint: string;
+  options: string[];
+  currentValue: string;
+}
+
+function SttSettingsSection({ pushToast }: { pushToast: (t: Toast) => void }) {
+  const [fields, setFields] = useState<SttConfigFieldDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      setFields(await invoke<SttConfigFieldDto[]>('get_stt_config'));
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Could not load voice settings', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setLoading(false);
+    }
+  }, [pushToast]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = async (key: string, value: string) => {
+    setBusy(key);
+    try {
+      await invoke('set_stt_config', { key, value });
+      await reload();
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">Voice &amp; dictation</h2>
+      <p className="mt-0.5 text-[11px] text-text-muted">ASR engine and dictation domain for the mic button in chat.</p>
+      {loading ? (
+        <div className="mt-4 text-[12px] text-text-muted">Loading…</div>
+      ) : (
+        <div className="mt-4 space-y-2">
+          {fields.map(f => (
+            <Row key={f.key} label={f.label} hint={f.hint}>
+              <div className="inline-flex flex-wrap items-center rounded-md border border-border-subtle bg-black/30 p-0.5">
+                {f.options.map(opt => (
+                  <button
+                    key={opt}
+                    type="button"
+                    disabled={busy === f.key}
+                    onClick={() => save(f.key, opt)}
+                    className={`rounded-[5px] px-2 py-1 font-display text-[10px] uppercase tracking-[0.12em] transition disabled:opacity-40 ${
+                      f.currentValue === opt ? 'bg-overlay-subtle text-text-primary' : 'text-text-muted hover:text-text-secondary'
+                    }`}
+                  >{opt}</button>
+                ))}
+              </div>
+            </Row>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+interface SettingsViewProps {
+  pushToast: (t: Toast) => void;
+  gamifyEnabled?: boolean;
+  hudTilesConfig?: HudTilesConfig;
+  onHudTilesChange?: (config: HudTilesConfig) => void;
+}
+
+export function SettingsView({ pushToast, gamifyEnabled, hudTilesConfig, onHudTilesChange }: SettingsViewProps) {
+  const { lang, setLang } = useLang();
+  const [section, setSection] = useState('orchestrator');
+  const { status: backendStatus } = useBackendStatus();
+  const sectionLocked = sectionLockedRemotely(section, backendStatus.mode);
+  const shownSection = sectionLocked ? '' : section;
+  const [filter, setFilter] = useState('');
+  const keybindings = useKeybindings();
+  const [capturingId, setCapturingId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!capturingId) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // A modifier alone is the first keydown of every chord; keep capturing until the real key.
+      if (['Control', 'Meta', 'Shift', 'Alt', 'AltGraph'].includes(e.key)) return;
+      const chord = chordFromEvent(e);
+      const next = { ...keybindings, [capturingId]: chord };
+      setBindings(next);
+      setCapturingId(null);
+    };
+    window.addEventListener('keydown', onKey, { capture: true });
+    return () => window.removeEventListener('keydown', onKey, { capture: true });
+  }, [capturingId, keybindings]);
+
+  // Deep link from omni-search: { section } seed in localStorage. Read on mount
+  // AND on the 'vox-settings-seed' event, so deep-linking works even when the
+  // Settings surface is already active (no remount fires in that case).
+  useEffect(() => {
+    const consume = () => {
+      try {
+        const raw = localStorage.getItem('vox_settings_seed');
+        if (raw) {
+          localStorage.removeItem('vox_settings_seed');
+          const seed = JSON.parse(raw) as { section?: string };
+          if (seed.section) setSection(seed.section);
+        }
+      } catch { /* ignore malformed seed */ }
+    };
+    consume();
+    window.addEventListener('vox-settings-seed', consume);
+    return () => window.removeEventListener('vox-settings-seed', consume);
+  }, []);
+  const [routing, setRouting] = useState({
+    efficiency: 25,
+    precision: 30,
+    latency: 20,
+    availability: 20,
+    balance: 5,
+    mobile: 0,
+  });
+  const [vals, setVals] = useState<SettingsState>({
+    doubt: true, autobudget: true, chatResearchEnabled: true, theme: 'arcane', concurrency: 7,
+    capUsd: DEFAULT_BUDGET_CAP_USD, doubtThresh: 0.6, sign: false, telemetry: 'local',
+    isolation: 'wasm', checkpointMins: 5,
+    scalingEnabled: false, minAgents: 1, scalingThreshold: 5,
+    harnessIssueDetectionEnabled: true,
+    scaleCpuCeilingPct: 85, scaleMemFloorMb: 1024,
+  });
+
+  // Mirror `vals` into a ref so `update` reads the freshest state, not a stale
+  // closure capture. Without this, a rapid second edit builds `next` from the
+  // pre-first-edit `vals` and persists the first field's old value to Vox.toml.
+  // The ref is written synchronously in `update` (not just via this effect) so
+  // two `update` calls in the same tick — before React re-renders — still
+  // compose instead of the second dropping the first's patch.
+  const valsRef = useRef(vals);
+  useEffect(() => { valsRef.current = vals; }, [vals]);
+
+  // Becomes true once mount hydration finishes. Until then `update` must not push
+  // hardcoded default OrchestratorConfig values to disk (an early click before
+  // get_orchestrator_config resolves would otherwise clobber real config).
+  const [hydrated, setHydrated] = useState(false);
+  const [prefAnnounce, setPrefAnnounce] = useState('');
+
+  const guiPrefMutation = useVoxMutation(
+    async (patch: Partial<SettingsState>) => {
+      for (const [k, v] of Object.entries(patch)) {
+        if ((GUI_PREF_KEYS as readonly string[]).includes(k)) {
+          await voxTransport.setGuiPreference(`gui.${k}`, String(v));
+        }
+      }
+    },
+    {
+      onSuccess: () => {
+        setPrefAnnounce('Preferences saved');
+        window.setTimeout(() => setPrefAnnounce(''), 3000);
+      },
+    },
+  );
+
+  const update = async (patch: Partial<SettingsState>) => {
+    const next = { ...valsRef.current, ...patch };
+    valsRef.current = next;
+    setVals(next);
+
+    // Apply the accent palette immediately on theme change (before/independent
+    // of persistence), so the swatch selection takes visible effect at once.
+    // `applyTheme` (lib/theme) drives the [data-theme] attribute the CSS hooks
+    // key off — the picker was previously inert.
+    if (patch.theme !== undefined) applyTheme(next.theme);
+
+    // GUI-only preferences (theme/telemetry/sign/checkpointMins) always persist —
+    // they don't depend on orchestrator hydration.
+    try {
+      const guiPatch = Object.fromEntries(
+        Object.entries(patch).filter(([k]) => (GUI_PREF_KEYS as readonly string[]).includes(k)),
+      ) as Partial<SettingsState>;
+      if (Object.keys(guiPatch).length > 0) {
+        await guiPrefMutation.mutateAsync(guiPatch);
+      }
+      // Defer orchestrator persistence until real values are loaded, so we never
+      // write defaults over a user's on-disk config before hydration completes.
+      if (hydrated) {
+        await invoke('set_orchestrator_config', { config: next });
+      }
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    }
+  };
+
+  useEffect(() => {
+    voxTransport.getRoutingSummaryLive().then((s: RoutingSummary) => {
+      if (s?.routing_priority) setRouting(s.routing_priority);
+    }).catch(() => {});
+    const hydrate = async () => {
+      try {
+        const [theme, telemetry, sign, checkpoint, statusRaw] = await Promise.all([
+          voxTransport.getGuiPreference('gui.theme'),
+          voxTransport.getGuiPreference('gui.telemetry'),
+          voxTransport.getGuiPreference('gui.sign'),
+          voxTransport.getGuiPreference('gui.checkpointMins'),
+          invoke<Uint8Array>('get_orchestrator_status_bin').catch(() => null),
+        ]);
+        let orchPatch: Partial<SettingsState> = {};
+        if (statusRaw) {
+          try {
+            const status = decode(statusRaw) as OrchestratorStatus;
+            if (typeof status.budget_cap === 'number') orchPatch.capUsd = status.budget_cap;
+            if (typeof status.agent_count === 'number') orchPatch.concurrency = status.agent_count;
+          } catch {
+            // ignore decode errors
+          }
+        }
+        setVals((prev) => ({
+          ...prev,
+          ...orchPatch,
+          theme: theme || prev.theme,
+          telemetry: telemetry || prev.telemetry,
+          sign: sign != null ? sign === 'true' : prev.sign,
+          // checkpointMins is a UI-only preference (no OrchestratorConfig field).
+          checkpointMins: checkpoint != null
+            ? (Number.isFinite(Number(checkpoint)) ? Number(checkpoint) : prev.checkpointMins)
+            : prev.checkpointMins,
+        }));
+      } catch {
+        // keep default local state when preference DB isn't available
+      }
+      // Hydrate orchestrator + scaling controls from the persisted Vox.toml
+      // [orchestrator] table (fixes the inert-sliders bug). Scaling fields are
+      // #273's resource-aware scaling; `setHydrated(true)` gates #229's persist
+      // path (see `if (hydrated)` in `update`).
+      try {
+        // A backend with no [orchestrator] table answers null; read it as empty (the updater
+        // below runs during render, so a throw here would take the whole surface down).
+        const cfg = (await invoke<Record<string, unknown> | null>('get_orchestrator_config')) ?? {};
+        const num = (k: string) => (cfg[k] == null ? undefined : Number(cfg[k]));
+        const bool = (k: string) => (cfg[k] == null ? undefined : Boolean(cfg[k]));
+        setVals((prev) => ({
+          ...prev,
+          ...(num('concurrency') != null ? { concurrency: num('concurrency')! } : {}),
+          ...(num('capUsd') != null ? { capUsd: num('capUsd')! } : {}),
+          ...(num('doubtThresh') != null ? { doubtThresh: num('doubtThresh')! } : {}),
+          ...(typeof cfg.isolation === 'string' ? { isolation: cfg.isolation } : {}),
+          ...(bool('autobudget') != null ? { autobudget: bool('autobudget')! } : {}),
+          ...(bool('doubt') != null ? { doubt: bool('doubt')! } : {}),
+          ...(bool('chatResearchEnabled') != null ? { chatResearchEnabled: bool('chatResearchEnabled')! } : {}),
+          ...(bool('scalingEnabled') != null ? { scalingEnabled: bool('scalingEnabled')! } : {}),
+          ...(bool('harnessIssueDetectionEnabled') != null ? { harnessIssueDetectionEnabled: bool('harnessIssueDetectionEnabled')! } : {}),
+          ...(num('minAgents') != null ? { minAgents: num('minAgents')! } : {}),
+          ...(num('scalingThreshold') != null ? { scalingThreshold: num('scalingThreshold')! } : {}),
+          ...(num('scaleCpuCeilingPct') != null ? { scaleCpuCeilingPct: num('scaleCpuCeilingPct')! } : {}),
+          ...(num('scaleMemFloorMb') != null ? { scaleMemFloorMb: num('scaleMemFloorMb')! } : {}),
+        }));
+      } catch {
+        // daemon-less dev: keep defaults
+      } finally {
+        setHydrated(true);
+      }
+    };
+    hydrate();
+    invoke<{ enabled: boolean; mode: string }>('get_gamify_settings').then(setGamify).catch(() => {});
+  }, []);
+
+  const [gamify, setGamify] = useState<{ enabled: boolean; mode: string }>({ enabled: true, mode: 'balanced' });
+
+  const updateGamify = async (patch: Partial<{ enabled: boolean; mode: string }>) => {
+    const next = { ...gamify, ...patch };
+    setGamify(next);
+    try {
+      await invoke('set_gamify_settings', { enabled: next.enabled, mode: next.mode });
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Gamify save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    }
+  };
+
+  const [advanced, setAdvanced] = useState(false);
+
+  // Trailing-debounce the success toast so a dragging RangeInline slider (which
+  // fires onChange on every tick) only surfaces one "saved" toast once the value
+  // settles. Persisting still happens on every change.
+  const savedToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (savedToastTimer.current) clearTimeout(savedToastTimer.current);
+  }, []);
+
+  const updateRouting = useCallback(async (patch: Partial<typeof routing>) => {
+    const next = { ...routing, ...patch };
+    setRouting(next);
+    try {
+      await voxTransport.setRoutingPriority(next);
+      if (savedToastTimer.current) clearTimeout(savedToastTimer.current);
+      savedToastTimer.current = setTimeout(() => {
+        pushToast({ tone: 'ok', title: 'Routing weights saved', body: 'VOX_AUTO_ROUTING_PRIORITY persisted', cause: 'backend-ok' });
+      }, 600);
+    } catch (err) {
+      if (savedToastTimer.current) {
+        clearTimeout(savedToastTimer.current);
+        savedToastTimer.current = null;
+      }
+      pushToast({ tone: 'warn', title: 'Routing save failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    }
+  }, [routing, pushToast]);
+
+  // The three user-facing characteristics map onto the 6-axis priority:
+  //   intelligence -> precision, efficiency -> efficiency, responsiveness -> latency.
+  // availability / balance / mobile are system-derived and preserved as-is.
+  const applyEmphasis = (e: { intelligence: number; efficiency: number; responsiveness: number }) =>
+    updateRouting({ precision: e.intelligence, efficiency: e.efficiency, latency: e.responsiveness });
+
+  const EMPHASIS_PRESETS: [string, { intelligence: number; efficiency: number; responsiveness: number }][] = [
+    ['Balanced',       { intelligence: 33, efficiency: 33, responsiveness: 34 }],
+    ['Intelligence',   { intelligence: 70, efficiency: 15, responsiveness: 15 }],
+    ['Efficiency',     { intelligence: 15, efficiency: 70, responsiveness: 15 }],
+    ['Responsiveness', { intelligence: 15, efficiency: 15, responsiveness: 70 }],
+  ];
+
+  // Reverse-map current 6-axis priority into the 3 user-facing characteristics.
+  const emphasis = {
+    intelligence: routing.precision,
+    efficiency: routing.efficiency,
+    responsiveness: routing.latency,
+  };
+  const activePreset = EMPHASIS_PRESETS.find(([, p]) =>
+    p.intelligence === emphasis.intelligence &&
+    p.efficiency === emphasis.efficiency &&
+    p.responsiveness === emphasis.responsiveness,
+  )?.[0] ?? null;
+
+  return (
+    <div className="grid grid-cols-12 gap-5">
+      <div role="status" aria-live="polite" className="sr-only">
+        {prefAnnounce}
+      </div>
+      <div className="col-span-12">
+        <RomanSurfaceHeader
+          domainTag="SYSTEM · SETTINGS"
+          title={useLabel('settings')}
+          headingLevel={2}
+          subtitle="LEX & STATUTA · CLAVIS SECRETS · ORCHESTRATOR POSTURE & ROUTING WEIGHTS"
+          waxSealBadge="CLAVIS SEALED"
+          icon={<Icon.shield className="size-4 text-[#F3E5AB]" />}
+          gauges={[
+            { label: 'Concurrency', valueText: `${vals.concurrency}`, ratio: Math.min(1, vals.concurrency / 16), tone: 'gold' },
+            { label: 'Budget Cap', valueText: `$${vals.capUsd}`, ratio: Math.min(1, vals.capUsd / 50), tone: 'emerald' },
+            { label: 'Doubt Floor', valueText: `${Math.round(vals.doubtThresh * 100)}%`, ratio: vals.doubtThresh, tone: 'gold' },
+          ]}
+        />
+      </div>
+      {/* Nav */}
+      <Glass
+        style={{
+          backgroundImage:
+            "linear-gradient(180deg, rgba(248, 243, 232, 0.96) 0%, rgba(235, 226, 208, 0.94) 100%), url('/assets/romanesque/travertine-parchment-tablet.jpg')",
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+        }}
+        className="vox-marble-tablet col-span-12 md:col-span-3 p-3 border-2 border-[#C59B27]/85 shadow-[0_8px_22px_rgba(0,0,0,0.48),inset_0_1px_0_rgba(255,255,255,0.92)]"
+      >
+        <input
+          value={filter}
+          onChange={e => setFilter(e.target.value)}
+          placeholder="Search settings…"
+          aria-label="Search settings"
+          className="mb-2 w-full rounded-lg border border-[#A67C1E] bg-[#FDFBF7] px-2.5 py-1.5 text-[12px] font-medium text-[#1C140C] placeholder:text-[#7A6136] outline-hidden focus:border-[#8C6825]"
+        />
+        {filter.trim() ? (
+          <nav className="flex flex-col gap-1">
+            {searchSettings(filter).map(entry => (
+              <button
+                key={entry.id}
+                type="button"
+                onClick={() => { setSection(entry.section); setFilter(''); }}
+                className="flex flex-col rounded-lg px-3 py-2 text-left text-[#2B1F0F] hover:bg-white/70 hover:text-[#1C140C] focus:outline-hidden focus-visible:ring-1 focus-visible:ring-[#8C6825]"
+              >
+                <span className="text-[12px] font-semibold">{entry.label}</span>
+                <span className="text-[10px] text-[#5C441E]">{entry.hint}</span>
+              </button>
+            ))}
+            {searchSettings(filter).length === 0 && (
+              <p className="px-3 py-2 text-[11px] text-[#5C441E]">No settings match.</p>
+            )}
+          </nav>
+        ) : (
+        <nav className="flex flex-col gap-1">
+          {SECTIONS.map(s => {
+            const IcoCmp = (Icon as any)[s.icon] ?? Icon.bolt;
+            const on = section === s.id;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                data-testid={`settings-nav-${s.id}`}
+                onClick={() => setSection(s.id)}
+                className={`flex items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
+                  on
+                    ? 'border-[#9A7014] bg-linear-to-r from-[#F3E5AB] via-[#E5CE82] to-[#DFC878] text-[#1C140C] font-bold shadow-[0_2px_6px_rgba(28,20,12,0.18),inset_0_1px_0_rgba(255,255,255,0.9)]'
+                    : 'border-transparent text-text-secondary hover:border-border-strong hover:bg-overlay-hover hover:text-text-primary'
+                }`}
+              >
+                <IcoCmp className={`size-4 ${on ? 'text-[#1C140C]' : 'text-[#6B5125]'}`} />
+                <span className="font-display text-[12px] font-semibold tracking-[0.12em] uppercase">{s.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+        )}
+      </Glass>
+
+      {/* Content */}
+      <Glass className="col-span-12 md:col-span-9 p-5">
+        {sectionLocked && <SurfaceUnavailable viewKey={`settings:${section}`} reason="needs_local_machine" />}
+        {sectionLocked && section === 'runtime' && <LlmSpendMeter />}
+        {shownSection === 'server' && <ServerConnectionSection pushToast={pushToast} />}
+        {shownSection === 'orchestrator' && (
+          <>
+            <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-orchestrator')}</h2>
+            <p className="mt-0.5 text-[11px] text-text-muted">Global scheduling, budget, and verification policy</p>
+            <div className="mt-4 space-y-3">
+              <Row label="Max concurrent agents" hint="Hard cap before scheduler back-pressure">
+                <RangeInline value={vals.concurrency} min={1} max={16} onChange={v => update({ concurrency: v })} />
+              </Row>
+              <Row label="Global budget cap (USD)" hint="Soft + hard cap. Throttles when reached.">
+                <RangeInline value={vals.capUsd} min={1} max={50} step={1} prefix="$" onChange={v => update({ capUsd: v })} />
+              </Row>
+              <Row label="Auto-doubt threshold" hint="Confidence floor below which Augur intervenes">
+                <RangeInline value={Math.round(vals.doubtThresh * 100)} min={0} max={100} step={5} suffix="%" onChange={v => update({ doubtThresh: v / 100 })} />
+              </Row>
+              <Row label="Durable checkpoint cadence" hint="Snapshot interval for resumable runs (UI preference)">
+                <RangeInline value={vals.checkpointMins} min={1} max={30} step={1} suffix=" min" onChange={v => update({ checkpointMins: v })} />
+              </Row>
+              <Row label="Default isolation tier" hint="Runtime sandbox for new agents">
+                <div className="inline-flex items-center rounded-md border border-border-subtle bg-black/30 p-0.5">
+                  {([['wasm', 'WASM'], ['ctr', 'Container'], ['native', 'Native']] as [string, string][]).map(([id, l]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => update({ isolation: id })}
+                      className={`rounded-[5px] px-2 py-1 font-display text-[10px] uppercase tracking-[0.15em] transition ${
+                        vals.isolation === id ? 'bg-overlay-subtle text-text-primary' : 'text-text-muted hover:text-text-secondary'
+                      }`}
+                    >
+                      {l}
+                    </button>
+                  ))}
+                </div>
+              </Row>
+              <Row label="Auto-doubt unverified outputs" hint="Inject Augur into the verify lane">
+                <Toggle on={vals.doubt} onClick={() => update({ doubt: !vals.doubt })} />
+              </Row>
+              <Row label="Auto-budget per agent" hint="Derived from skill + recent burn">
+                <Toggle on={vals.autobudget} onClick={() => update({ autobudget: !vals.autobudget })} />
+              </Row>
+              <Row label="Autonomous chat research" hint="Allow orchestrator to trigger live deep research during chat turns">
+                <Toggle
+                  data-testid="toggle-chat-research"
+                  on={vals.chatResearchEnabled}
+                  onClick={() => update({ chatResearchEnabled: !vals.chatResearchEnabled })}
+                />
+              </Row>
+            </div>
+          </>
+        )}
+
+        {shownSection === 'scaling' && (
+          <>
+            <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-scaling')}</h2>
+            <p className="mt-0.5 text-[11px] text-text-muted">Spawn and retire agents automatically based on queue load and local host resources</p>
+            <div className="mt-4 space-y-3">
+              <Row label="Auto-scaling" hint="Let the orchestrator add/remove agents dynamically">
+                <Toggle on={vals.scalingEnabled} onClick={() => update({ scalingEnabled: !vals.scalingEnabled })} />
+              </Row>
+              <Row label="Harness issue detection" hint="Watch chat turns for repeated mistakes and surface a review queue">
+                <Toggle
+                  on={vals.harnessIssueDetectionEnabled}
+                  onClick={() => update({ harnessIssueDetectionEnabled: !vals.harnessIssueDetectionEnabled })}
+                />
+              </Row>
+              <Row label="Min agents" hint="Never retire below this fleet size">
+                <RangeInline value={vals.minAgents} min={0} max={8} onChange={v => update({ minAgents: v })} />
+              </Row>
+              <Row label="Max agents" hint="Hard ceiling on concurrent agents">
+                <RangeInline value={vals.concurrency} min={1} max={16} onChange={v => update({ concurrency: v })} />
+              </Row>
+              <Row label="Queue threshold" hint="Per-agent queued tasks that trigger a scale-up">
+                <RangeInline value={vals.scalingThreshold} min={1} max={20} onChange={v => update({ scalingThreshold: v })} />
+              </Row>
+              <Row label="CPU ceiling" hint="Don't spawn agents while local CPU is above this (0 = off)">
+                <RangeInline value={vals.scaleCpuCeilingPct} min={0} max={100} step={5} suffix="%" onChange={v => update({ scaleCpuCeilingPct: v })} />
+              </Row>
+              <Row label="Memory floor" hint="Don't spawn agents below this free RAM (0 = off)">
+                <RangeInline value={vals.scaleMemFloorMb} min={0} max={16384} step={256} suffix=" MiB" onChange={v => update({ scaleMemFloorMb: v })} />
+              </Row>
+            </div>
+          </>
+        )}
+
+        {shownSection === 'llm' && (
+          <LlmSettingsSection
+            pushToast={pushToast}
+            onJumpToKeysSecrets={() => {
+              setSection('secrets');
+              requestAnimationFrame(() => {
+                scrollAndFocusAnchor('keys-secrets-section');
+              });
+            }}
+          />
+        )}
+
+        {shownSection === 'routing' && (
+          <>
+            <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-routing')}</h2>
+            <p className="mt-0.5 text-[11px] text-text-muted">Emphasis tunes how the scorer trades off intelligence, efficiency, and responsiveness (persisted to VOX_AUTO_ROUTING_PRIORITY)</p>
+
+            {/* Emphasis: presets + three labeled characteristic sliders */}
+            <div className="mt-4 rounded-xl border border-border-subtle bg-overlay-subtle p-3">
+              <div className="font-display text-[12px] tracking-[0.12em] uppercase text-text-secondary">Emphasis</div>
+              <div className="mt-3 grid grid-cols-2 gap-2 md:grid-cols-4">
+                {EMPHASIS_PRESETS.map(([name, preset]) => (
+                  <button
+                    key={name}
+                    type="button"
+                    onClick={() => applyEmphasis(preset)}
+                    className={`rounded-lg border p-2 text-center transition ${
+                      activePreset === name ? 'border-brass/40 bg-brass/5 text-text-primary' : 'border-border-subtle bg-overlay-subtle text-text-muted hover:border-white/15 hover:text-text-secondary'
+                    }`}
+                  >
+                    <span className="font-display text-[11px] tracking-wide">{name}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="mt-3 space-y-3">
+                <Row label="Intelligence" hint="Prefer higher-capability models">
+                  <RangeInline value={emphasis.intelligence} min={0} max={100} onChange={v => applyEmphasis({ ...emphasis, intelligence: v })} />
+                </Row>
+                <Row label="Efficiency" hint="Prefer cheaper models when viable">
+                  <RangeInline value={emphasis.efficiency} min={0} max={100} onChange={v => applyEmphasis({ ...emphasis, efficiency: v })} />
+                </Row>
+                <Row label="Responsiveness" hint="Prefer faster p50 models">
+                  <RangeInline value={emphasis.responsiveness} min={0} max={100} onChange={v => applyEmphasis({ ...emphasis, responsiveness: v })} />
+                </Row>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setAdvanced(a => !a)}
+              className="mt-4 font-display text-[11px] uppercase tracking-[0.15em] text-text-muted hover:text-text-secondary"
+            >
+              {advanced ? '▾ Hide advanced axes' : '▸ Advanced (all 6 axes)'}
+            </button>
+
+            {advanced && (
+            <div className="mt-3 space-y-3">
+              <Row label="Efficiency (cost)" hint="Prefer cheaper models when viable">
+                <RangeInline value={routing.efficiency} min={0} max={100} onChange={v => updateRouting({ efficiency: v })} />
+              </Row>
+              <Row label="Precision (intelligence)" hint="Prefer higher-capability models">
+                <RangeInline value={routing.precision} min={0} max={100} onChange={v => updateRouting({ precision: v })} />
+              </Row>
+              <Row label="Latency (responsiveness)" hint="Prefer faster p50 models">
+                <RangeInline value={routing.latency} min={0} max={100} onChange={v => updateRouting({ latency: v })} />
+              </Row>
+              <Row label="Availability" hint="Weight provider quota / uptime signals">
+                <RangeInline value={routing.availability} min={0} max={100} onChange={v => updateRouting({ availability: v })} />
+              </Row>
+              <Row label="Balance (context fill)" hint="Prefer models sized to prompt context">
+                <RangeInline value={routing.balance} min={0} max={100} onChange={v => updateRouting({ balance: v })} />
+              </Row>
+              <Row label="Mobile / local bias" hint="Prefer Ollama / mesh when set high">
+                <RangeInline value={routing.mobile} min={0} max={100} onChange={v => updateRouting({ mobile: v })} />
+              </Row>
+            </div>
+            )}
+
+            {/* Ordered priority chain — the additive, orderable form of emphasis.
+                An EmphasizeAxis step is the ordered version of the sliders above. */}
+            <PriorityChainEditor pushToast={pushToast} />
+
+            {/* Per-task-category / per-trigger-source overrides on top of the
+                global emphasis/priority chain above. */}
+            <TaskPolicySection />
+          </>
+        )}
+
+        {shownSection === 'runtime' && <RuntimeConfigSection pushToast={pushToast} />}
+        {shownSection === 'voice' && <SttSettingsSection pushToast={pushToast} />}
+
+        {shownSection === 'mesh' && <MeshPeersSection pushToast={pushToast} />}
+
+        {shownSection === 'signing' && (
+          <SigningKeysSection vals={vals} update={update} pushToast={pushToast} gamifyEnabled={gamifyEnabled} />
+        )}
+
+        {shownSection === 'secrets' && (
+          <div id="keys-secrets-section" tabIndex={-1}>
+            <KeysSecretsSection pushToast={pushToast} gamifyEnabled={gamifyEnabled} />
+          </div>
+        )}
+
+        {shownSection === 'telemetry' && (
+          <>
+            <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-telemetry')}</h2>
+            <p className="mt-0.5 text-[11px] text-text-muted">Where Vox sends spans, metrics, and traces</p>
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              {([['off', 'Off', 'Nothing leaves the device'], ['local', 'Local', 'OTLP → localhost:4317'], ['cloud', 'Cloud', 'Encrypted → vendor']] as [string, string, string][]).map(([id, l, h]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => update({ telemetry: id })}
+                  className={`rounded-xl border p-3 text-left transition ${
+                    vals.telemetry === id ? 'border-brass/40 bg-brass/5' : 'border-border-subtle hover:border-white/15 bg-overlay-subtle'
+                  }`}
+                >
+                  <div className="font-display text-[12px] tracking-wider text-text-primary">{l}</div>
+                  <div className="mt-1 font-mono text-[10px] text-text-muted">{h}</div>
+                </button>
+              ))}
+            </div>
+            <div className="mt-4 rounded-xl border border-border-subtle bg-overlay-subtle p-3" data-testid="community-intelligence-settings-card">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="font-display text-[12px] text-text-secondary">Community Intelligence Bundle (k &gt;= 20 · Ed25519 Signed)</div>
+                  <div className="text-[11px] text-text-muted">
+                    Bounded Empirical Bayes priors (±15% max weight delta) from ~/.vox/cache/community-intelligence.v1.json. Set VOX_COMMUNITY_INTELLIGENCE=off to disable independently of telemetry upload.
+                  </div>
+                </div>
+                <span className="shrink-0 rounded border border-emerald-600/50 bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-700">
+                  Ed25519 Verified · Offline Ready
+                </span>
+              </div>
+            </div>
+          </>
+        )}
+
+        {shownSection === 'onboarding' && <OnboardingSection />}
+
+        {shownSection === 'keybinds' && (
+          <>
+            <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-keybinds')}</h2>
+            <p className="mt-0.5 text-[11px] text-text-muted">Click a shortcut to rebind it. Press any key combination to set the new chord.</p>
+            <div className="mt-4 grid grid-cols-1 gap-1.5 md:grid-cols-2">
+              {ACTION_REGISTRY.map(a => (
+                <div key={a.id} className="flex items-center justify-between rounded-md border border-border-subtle bg-overlay-subtle px-3 py-2">
+                  <span className="text-[12px] text-text-secondary">{a.label}</span>
+                  <button
+                    type="button"
+                    data-testid={`keybind-btn-${a.id}`}
+                    onClick={() => setCapturingId(capturingId === a.id ? null : a.id)}
+                    className={`rounded border px-2 py-0.5 font-mono text-[10px] transition ${
+                      capturingId === a.id
+                        ? 'border-brass/60 bg-brass/10 text-brass animate-pulse'
+                        : 'border-border-subtle bg-overlay-subtle text-text-secondary hover:border-white/20'
+                    }`}
+                  >
+                    {capturingId === a.id ? 'press keys…' : (keybindings[a.id] ?? DEFAULT_BINDINGS[a.id])}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setBindings(DEFAULT_BINDINGS);
+                setCapturingId(null);
+              }}
+              className="mt-3 rounded-md border border-border-subtle bg-overlay-subtle px-3 py-1.5 text-[11px] text-text-muted hover:text-text-secondary transition"
+            >
+              Reset to defaults
+            </button>
+          </>
+        )}
+
+        {shownSection === 'gamify' && (
+          <div className="space-y-3">
+            <label className="flex items-center justify-between rounded-lg border border-border-subtle bg-overlay-subtle p-3 text-sm">
+              <span>Gamification enabled</span>
+              <input type="checkbox" checked={gamify.enabled} onChange={e => updateGamify({ enabled: e.target.checked })} />
+            </label>
+            <label className="flex items-center justify-between rounded-lg border border-border-subtle bg-overlay-subtle p-3 text-sm">
+              <span>Mode</span>
+              <select
+                aria-label="Gamification mode"
+                value={gamify.mode}
+                disabled={!gamify.enabled}
+                onChange={e => updateGamify({ mode: e.target.value })}
+                className="rounded-sm bg-black/40 px-2.5 py-1 pr-7 text-text-secondary"
+              >
+                <option value="balanced">Balanced</option>
+                <option value="serious">Serious (silent)</option>
+                <option value="learning">Learning</option>
+              </select>
+            </label>
+            <p className="text-[11px] text-text-muted">Serious mode keeps rewards active but hides overlays and hints.</p>
+          </div>
+        )}
+
+        {shownSection === 'theme' && (
+          <>
+            <h2 className="font-display text-[18px] font-semibold tracking-tight text-text-primary">{useLabel('set-theme')}</h2>
+            <p className="mt-0.5 text-[11px] text-text-muted">
+              Select the unified Imperial Carrara White &amp; Gold aesthetic (default) or switch to the Minimalist Grey-Blue Slate dark mode for a distraction-free dark workspace.
+            </p>
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
+              {[
+                {
+                  id: 'arcane',
+                  name: 'Imperial Carrara White & Gold (Default)',
+                  subtitle: 'Sunlit white/cream honed Carrara marble, burnished gold mouldings, Romanesque serif typography, and emerald laurel working signets.',
+                  swatch: 'from-[#FAF6EE] via-[#EFE6D5] to-[#D4AF37]',
+                  badge: 'DEFAULT · ROMAN MARBLE',
+                },
+                {
+                  id: 'void',
+                  name: 'Minimalist Grey-Blue Slate (Void / Dark)',
+                  subtitle: 'Clean, distraction-free dark grey-blue basalt & slate palette (#0c0e10 / #15191c / #1f262b) with crisp geometry and zero marble textures.',
+                  swatch: 'from-[#0c0e10] via-[#15191c] to-[#38bdf8]',
+                  badge: 'MINIMALIST DARK',
+                },
+                {
+                  id: 'glacier',
+                  name: 'Travertine Daylight',
+                  subtitle: 'Warm architectural Roman travertine stone with understated bronze & verdigris accents.',
+                  swatch: 'from-[#F4EEE1] via-[#E3DBC8] to-[#A8842F]',
+                  badge: 'WARM STONE',
+                },
+                {
+                  id: 'high-contrast',
+                  name: 'High Contrast Obsidian & Gold',
+                  subtitle: 'Maximum WCAG AAA contrast obsidian black (#000000) with pure white typography and high-luminance gold & emerald signets.',
+                  swatch: 'from-[#000000] via-[#0a0a0a] to-[#D4AF37]',
+                  badge: 'WCAG AAA DARK',
+                },
+              ].map(t => {
+                const isSelected =
+                  vals.theme === t.id ||
+                  (t.id === 'void' && vals.theme === 'slate') ||
+                  (t.id === 'arcane' && !vals.theme);
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    data-testid={`settings-theme-card-${t.id}`}
+                    data-multiline="true"
+                    aria-pressed={isSelected}
+                    onClick={() => {
+                      applyTheme(t.id);
+                      update({ theme: t.id });
+                    }}
+                    className={`overflow-hidden whitespace-normal rounded-xl border-2 p-3.5 text-left transition ${
+                      isSelected
+                        ? 'border-brass bg-brass/12 shadow-[0_4px_14px_rgba(28,20,12,0.16)]'
+                        : 'border-border-subtle hover:border-border-strong bg-overlay-subtle'
+                    }`}
+                  >
+                    <div data-theme-swatch="true" className={`h-16 w-full rounded-lg border border-border-subtle bg-linear-to-br ${t.swatch}`} />
+                    <div className="mt-2.5 flex flex-wrap items-center justify-between gap-1.5">
+                      <div className="font-display text-[11.5px] font-bold tracking-wider text-text-primary">{t.name}</div>
+                      <span className="shrink-0 rounded border border-border-strong bg-bg-elevated px-1.5 py-0.5 font-display text-[8.5px] font-bold uppercase tracking-widest text-text-secondary">
+                        {isSelected ? 'ACTIVE' : t.badge}
+                      </span>
+                    </div>
+                    <p className="mt-1.5 whitespace-normal text-[11px] leading-snug text-text-muted">{t.subtitle}</p>
+                  </button>
+                );
+              })}
+            </div>
+            {(() => {
+              const contractReport = getThemeContractHealthReport(vals.theme);
+              return (
+                <div
+                  data-testid="theme-contract-observability-card"
+                  className="mt-4 rounded-xl border border-border-subtle bg-bg-surface p-3.5 space-y-2.5"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="font-display text-[11px] font-bold uppercase tracking-[0.14em] text-text-primary">
+                        Theme Contract Observability Ledger · {contractReport.contractId}
+                      </div>
+                      <div className="text-[11px] text-text-muted">
+                        Enforced by Style Dictionary, Vitest self-expanding surface discovery, and static rule vox/ui/theme-contract-drift.
+                      </div>
+                    </div>
+                    <span
+                      data-testid="theme-contract-status-badge"
+                      className="shrink-0 rounded-full border border-status-pass/50 bg-status-pass/15 px-2.5 py-0.5 font-display text-[9.5px] font-bold uppercase tracking-widest text-status-pass"
+                    >
+                      {contractReport.enforced ? 'ENFORCED · ZERO DRIFT' : 'DRIFT DETECTED'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 text-[11px]">
+                    <div className="rounded-lg border border-border-subtle bg-bg-elevated px-2.5 py-2">
+                      <div className="font-display text-[9px] uppercase tracking-wider text-text-muted">Active Profile</div>
+                      <div className="mt-0.5 font-semibold text-text-primary truncate">{contractReport.activeThemeLabel}</div>
+                    </div>
+                    <div className="rounded-lg border border-border-subtle bg-bg-elevated px-2.5 py-2">
+                      <div className="font-display text-[9px] uppercase tracking-wider text-text-muted">Semantic Tokens</div>
+                      <div className="mt-0.5 font-semibold text-text-primary">
+                        {contractReport.resolvedSemanticVarCount} / {contractReport.requiredSemanticVarCount} Verified · WCAG {contractReport.minContrastRatio.toFixed(1)}:1
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-border-subtle bg-bg-elevated px-2.5 py-2">
+                      <div className="font-display text-[9px] uppercase tracking-wider text-text-muted">Auto-Enrolled Surfaces</div>
+                      <div className="mt-0.5 font-semibold text-text-primary">
+                        {contractReport.enrolledSurfaceCount} Views
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-border-subtle bg-bg-elevated px-2.5 py-2">
+                      <div className="font-display text-[9px] uppercase tracking-wider text-text-muted">Auto-Enrolled Docks</div>
+                      <div className="mt-0.5 font-semibold text-text-primary">
+                        {contractReport.enrolledChatDockCount} Chat Docks
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </>
+        )}
+
+        {shownSection === 'display' && (
+          <>
+            <Row label="Latin labels" hint="Show nav and section names in Latin">
+              <Toggle on={lang === 'la'} onClick={() => setLang(lang === 'la' ? 'en' : 'la')} />
+            </Row>
+            {hudTilesConfig && onHudTilesChange && (
+              <HudTilesEditor config={hudTilesConfig} onChange={onHudTilesChange} />
+            )}
+          </>
+        )}
+      </Glass>
+    </div>
+  );
+}

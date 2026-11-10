@@ -1,0 +1,79 @@
+/**
+ * Central timing, limit, and debounce constants for the Vox GUI.
+ * Import these instead of inline numeric literals in setInterval/setTimeout/debounce.
+ */
+
+/** Policy badge refresh interval in sidebar (ms). */
+export const POLICY_BADGE_POLL_MS = 60_000;
+
+/** Approvals surface poll interval (ms). */
+export const APPROVALS_POLL_MS = 2000;
+
+/** Attention inbox poll interval (ms) — single interval for the unified Needs-You inbox. */
+export const ATTENTION_POLL_MS = 5000;
+
+/** Runs surface poll interval (ms). */
+export const RUNS_POLL_MS = 10_000;
+
+/** Gamify surface poll interval (ms). */
+export const GAMIFY_POLL_MS = 15_000;
+
+/** Mesh view refresh interval (ms). */
+export const MESH_REFRESH_MS = 5000;
+
+/** Matrix routing intentions poll interval (ms). */
+export const MATRIX_POLL_MS = 8000;
+
+/** Max dashboard activity stream items retained. */
+export const STREAM_CAP = 100;
+
+/** Loquela composer input history cap. */
+export const COMPOSER_HISTORY_CAP = 30;
+
+/** Unified search debounce (ms). */
+export const SEARCH_DEBOUNCE_MS = 200;
+
+/** Memory auto-recall debounce (ms). */
+export const MEMORY_RECALL_DEBOUNCE_MS = 450;
+
+/** Command palette backend preview hit limit. */
+export const PALETTE_PREVIEW_LIMIT = 8;
+
+/** Default search result page size. */
+export const SEARCH_TOP_K = 30;
+
+/** GUI runs list limit. */
+export const RUNS_LIST_LIMIT = 40;
+
+/** Model scoreboard window (days). */
+export const SCOREBOARD_WINDOW_DAYS = 7;
+
+/** Model list fetch limit (composer + harness + pickers).
+ *  Must cover the full OpenRouter catalog plus locals — a low cap plus
+ *  alphabetical sort used to return only the first `aion-labs/*` rows. */
+export const MODEL_LIST_LIMIT = 2000;
+
+/** Loquela "Run on" picker fetch cap (same as MODEL_LIST_LIMIT). */
+export const LOQUELA_TIER_MODEL_COUNT = MODEL_LIST_LIMIT;
+
+/** Loquela @file picker debounce (ms). */
+export const LOQUELA_FILE_PICKER_DEBOUNCE_MS = 200;
+
+/** Loquela "Run on" live model-search debounce (ms). */
+export const LOQUELA_MODEL_SEARCH_DEBOUNCE_MS = 200;
+
+/** Loquela live model-search result cap. */
+export const LOQUELA_MODEL_SEARCH_LIMIT = 80;
+
+/** Loquela @file picker suggestion cap. */
+export const LOQUELA_FILE_PICKER_LIMIT = 20;
+
+/** Live indicator: orch-status event considered fresh within this window (ms). */
+export const LIVE_EVENT_FRESH_MS = 10_000;
+
+/** Dockview layout persistence debounce (ms). */
+export const LAYOUT_PERSIST_DEBOUNCE_MS = 1000;
+
+/** Trailing debounce for Activity view refreshes: a burst of rows becomes one query, and the wait gives the
+ *  daemon's activity sink time to commit the row before the view reads it. */
+export const ACTIVITY_REFRESH_DEBOUNCE_MS = 250;

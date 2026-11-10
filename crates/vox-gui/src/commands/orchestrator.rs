@@ -1,0 +1,1108 @@
+use std::sync::Arc;
+
+use serde::Serialize;
+use tauri::Emitter;
+use vox_config::timeouts::D_2S;
+use vox_foundation::protocol::orch_daemon_method;
+use vox_orchestrator::orch_daemon::OrchDaemonClient;
+use vox_package_types::manifest::VoxManifest;
+
+use crate::commands::daemon::PersistentDaemon;
+
+/// Tauri event channel carrying live orchestrator status snapshots to the UI.
+pub const ORCH_STATUS_EVENT: &str = "vox://orch-status";
+
+/// Backoff between reconnect attempts for the status/event streams (T3.1).
+/// Short enough that a reconnect is not user-visible for a transient blip,
+/// long enough not to hammer a daemon that is still coming up after a spawn.
+const STREAM_RECONNECT_BACKOFF: std::time::Duration = D_2S;
+
+/// Spawn a background task that subscribes to the orchestrator daemon's status
+/// stream and re-emits each snapshot as the [`ORCH_STATUS_EVENT`] Tauri event.
+///
+/// T3.1: this is a **reconnect loop**, not a one-shot subscription — when the
+/// stream ends for any reason (daemon death, network blip, subscribe error),
+/// it waits [`STREAM_RECONNECT_BACKOFF`], re-resolves the daemon via
+/// [`PersistentDaemon::ensure_live`] (which detects and replaces a dead
+/// cached daemon rather than reusing a stale address), and resubscribes. The
+/// loop only exits if the `AppHandle` itself is gone (the app is shutting
+/// down), so a mid-session daemon death self-heals instead of producing
+/// permanent silent staleness. The emitted payload has the same shape as
+/// [`get_orchestrator_status`] (the GUI-mapped status object with `agent_count`).
+// toestub-ignore(skeleton/untested-pub-api) — spawns a background task bridging the orchestrator daemon to Tauri events; covered by integration
+pub fn spawn_orchestrator_status_stream(
+    app_handle: tauri::AppHandle,
+    daemon: Arc<PersistentDaemon>,
+    backend: Arc<crate::remote::backend::BackendState>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let addr = match daemon.ensure_live().await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!("daemon unavailable: {e}; retrying");
+                    tokio::time::sleep(STREAM_RECONNECT_BACKOFF).await;
+                    continue;
+                }
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(
+                crate::config::ORCH_STATUS_CHANNEL_CAP,
+            );
+
+            let token = daemon.token().await;
+            // Drive the subscription in its own task so we can drain `rx` concurrently.
+            let producer = tokio::spawn(async move {
+                let client = match token {
+                    Some(t) => OrchDaemonClient::with_token(addr, t),
+                    None => OrchDaemonClient::new(addr),
+                };
+                client.subscribe(tx).await
+            });
+
+            while let Some(raw) = rx.recv().await {
+                if backend.is_remote() {
+                    continue;
+                }
+                let gui_status = to_gui_status(raw);
+                if let Ok(value) = serde_json::to_value(&gui_status) {
+                    let _ = app_handle.emit(ORCH_STATUS_EVENT, value);
+                }
+            }
+
+            // Stream ended (daemon stopped or errored). Invalidate the cached
+            // daemon so the next loop iteration's `ensure_live` re-resolves
+            // rather than trusting a connection we just watched die, then
+            // back off before reconnecting.
+            let _ = producer.await;
+            daemon.invalidate().await;
+            tokio::time::sleep(STREAM_RECONNECT_BACKOFF).await;
+        }
+    });
+}
+
+/// Tauri event channel carrying live agent events from the orchestrator daemon
+/// to the UI. Payload is a serialized `AgentEvent` value
+/// (`{ id, timestamp_ms, kind: { type, ..fields } }`).
+pub const AGENT_EVENTS_EVENT: &str = "vox://agent-events";
+
+/// Extract the durable-op offset (`op_id`) to resume from after a reconnect,
+/// from either a live `AgentEvent` frame's `id` field or a T1.3
+/// replay-envelope frame's `op_id` field (`{ replay: true, op_id, ... }`,
+/// see `orch_daemon::replay_frame_value`). Falls back to leaving the offset
+/// unchanged (`None`) if the frame has neither — a best-effort forward
+/// cursor, not a correctness-critical one (a missed bump just means the next
+/// reconnect replays slightly more than strictly necessary, never less).
+fn extract_offset(value: &serde_json::Value) -> Option<u64> {
+    value
+        .get("op_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| value.get("id").and_then(|v| v.as_u64()))
+}
+
+/// Spawn a background task that subscribes to the orchestrator daemon's
+/// agent-event stream and re-emits each event as the [`AGENT_EVENTS_EVENT`]
+/// Tauri event.
+///
+/// Mirrors [`spawn_orchestrator_status_stream`] (the B1 pattern) as a
+/// **reconnect loop** (T3.1): the first connection uses plain
+/// `subscribe_events`; every reconnect after a stream drop uses
+/// [`OrchDaemonClient::subscribe_events_from_offset`] with the last-seen
+/// event's offset (tracked via [`extract_offset`]) so events emitted during
+/// the outage are replayed from Tier-A durable history instead of silently
+/// skipped. If the daemon is unavailable, the task backs off and retries
+/// rather than exiting. Each emitted payload is the raw serialized
+/// `AgentEvent` (or T1.3 replay envelope) forwarded verbatim from the daemon.
+// toestub-ignore(skeleton/untested-pub-api) — spawns a background task bridging the orchestrator daemon to Tauri events; covered by integration
+pub fn spawn_agent_event_stream(
+    app_handle: tauri::AppHandle,
+    daemon: Arc<PersistentDaemon>,
+    backend: Arc<crate::remote::backend::BackendState>,
+) {
+    tokio::spawn(async move {
+        let mut last_offset: Option<u64> = None;
+        loop {
+            let addr = match daemon.ensure_live().await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!("daemon unavailable: {e}; retrying");
+                    tokio::time::sleep(STREAM_RECONNECT_BACKOFF).await;
+                    continue;
+                }
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(
+                crate::config::AGENT_EVENTS_CHANNEL_CAP,
+            );
+
+            let token = daemon.token().await;
+            let from_offset = last_offset;
+            // Drive the subscription in its own task so we can drain `rx` concurrently.
+            let producer = tokio::spawn(async move {
+                let client = match token {
+                    Some(t) => OrchDaemonClient::with_token(addr, t),
+                    None => OrchDaemonClient::new(addr),
+                };
+                match from_offset {
+                    // Reconnect: replay everything since the last event we saw.
+                    Some(offset) => client.subscribe_events_from_offset(offset, tx).await,
+                    // First connection: plain live-tail, no replay needed.
+                    None => client.subscribe_events(tx).await,
+                }
+            });
+
+            while let Some(value) = rx.recv().await {
+                if backend.is_remote() {
+                    continue;
+                }
+                if let Some(offset) = extract_offset(&value) {
+                    last_offset = Some(offset);
+                }
+                let mut value = value;
+                let loggable = super::event_annotate::annotate_agent_event(&mut value);
+                let _ = app_handle.emit(AGENT_EVENTS_EVENT, value);
+                if loggable {
+                    let _ = app_handle.emit(super::event_annotate::ACTIVITY_APPENDED_EVENT, ());
+                }
+            }
+
+            // Stream ended (daemon stopped or errored). Invalidate the cached
+            // daemon so the next loop iteration's `ensure_live` re-resolves,
+            // then back off before reconnecting (with replay-from-offset).
+            let _ = producer.await;
+            daemon.invalidate().await;
+            tokio::time::sleep(STREAM_RECONNECT_BACKOFF).await;
+        }
+    });
+}
+
+/// Tauri event emitted every time any orchestrator task changes state
+/// (created, updated, reordered, cancelled). Frontend subscribers should
+/// call their refresh function on receipt.
+pub const TASKS_CHANGED_EVENT: &str = "vox://tasks-changed";
+
+/// Emit [`TASKS_CHANGED_EVENT`] to all webview windows.
+///
+/// Call this after any mutation to orchestrator task state. The frontend
+/// `TasksView` subscribes to this event to refresh its task list without
+/// polling.
+pub fn emit_tasks_changed<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    // `emit` broadcasts to all windows. A unit payload `()` serialises to `null`.
+    let _ = app_handle.emit(TASKS_CHANGED_EVENT, ());
+}
+
+/// Tauri event emitted when the secretary detects actionable intent in a
+/// chat message and *proposes* a task. Task 0.2 (harness parity plan): the
+/// secretary is propose-only — this event does not mean a task exists yet.
+/// The frontend must call `secretary_confirm_task` (passing back
+/// `session_id`/`intent`) to actually submit it. Payload: `SecretaryProposedPayload`.
+pub const SECRETARY_PROPOSED_EVENT: &str = "vox://secretary-proposed-task";
+
+/// Payload for the [`SECRETARY_PROPOSED_EVENT`] Tauri event.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct SecretaryProposedPayload {
+    /// Client-side proposal id (NOT a hopper/task id — no task has been
+    /// submitted yet). Only used to correlate the toast with a confirm/dismiss
+    /// action in the frontend.
+    pub item_id: String,
+    /// Cleaned intent text that would be submitted as the task description
+    /// if the user confirms.
+    pub intent: String,
+    /// Classifier confidence 0–100 (for UI display only; not a guarantee).
+    pub confidence_pct: u8,
+    /// Chat session id the message came from — passed back to
+    /// `secretary_confirm_task` on confirm.
+    pub session_id: String,
+}
+
+/// Emit [`SECRETARY_PROPOSED_EVENT`] to all webview windows.
+pub fn emit_secretary_proposed<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    payload: SecretaryProposedPayload,
+) {
+    let _ = app_handle.emit(SECRETARY_PROPOSED_EVENT, payload);
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GuiAgentSummary {
+    pub id: u64,
+    pub codename: String,
+    pub paused: bool,
+    pub in_progress: bool,
+    pub current_phase: Option<String>,
+    pub active_skill: Option<String>,
+    pub queued: usize,
+    pub urgent_count: usize,
+    pub normal_count: usize,
+    pub background_count: usize,
+    pub completed: usize,
+    pub owned_files: usize,
+    pub weighted_load: f64,
+    pub cost: Option<f64>,
+    pub budget: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GuiOrchestratorStatus {
+    pub agent_count: usize,
+    pub total_queued: usize,
+    pub total_in_progress: usize,
+    pub total_completed: usize,
+    pub total_doubted: usize,
+    pub total_weighted_load: f64,
+    pub predicted_load: f64,
+    pub agents: Vec<GuiAgentSummary>,
+    pub recent_events: Vec<serde_json::Value>,
+    pub alerts: Vec<serde_json::Value>,
+    pub peers: Vec<serde_json::Value>,
+    pub total_cost: f64,
+    pub budget_cap: f64,
+    pub mesh_throughput: f64,
+    pub total_vram_gb: f64,
+    /// Live attention-budget snapshot passed through verbatim from the daemon (Track D). May be null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_budget: Option<serde_json::Value>,
+}
+
+fn get_u64(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+fn get_f64(v: &serde_json::Value, key: &str) -> f64 {
+    v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
+}
+
+/// Read a numeric field only if present, leaving `None` (unknown) otherwise.
+/// Never fabricates a value when the daemon did not report one.
+fn get_opt_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(|x| x.as_f64())
+}
+
+async fn call_orchestrator_daemon(
+    daemon: &PersistentDaemon,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let addr = daemon.ensure().await?;
+    let client = match daemon.token().await {
+        Some(token) => OrchDaemonClient::with_token(addr, token),
+        None => OrchDaemonClient::new(addr),
+    };
+    client.call(method, params).await.map_err(|e| e.to_string())
+}
+
+async fn daemon_status(daemon: &PersistentDaemon) -> Result<serde_json::Value, String> {
+    call_orchestrator_daemon(daemon, orch_daemon_method::STATUS, serde_json::json!({})).await
+}
+
+fn to_gui_status(status: serde_json::Value) -> GuiOrchestratorStatus {
+    GuiOrchestratorStatus {
+        agent_count: get_u64(&status, "agent_count") as usize,
+        total_queued: get_u64(&status, "total_queued") as usize,
+        total_in_progress: get_u64(&status, "total_in_progress") as usize,
+        total_completed: get_u64(&status, "total_completed") as usize,
+        total_doubted: get_u64(&status, "total_doubted") as usize,
+        total_weighted_load: get_f64(&status, "total_weighted_load"),
+        predicted_load: get_f64(&status, "predicted_load"),
+        agents: status
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|agent| GuiAgentSummary {
+                id: agent.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+                codename: agent
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Agent")
+                    .to_string(),
+                paused: agent
+                    .get("paused")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                in_progress: agent
+                    .get("in_progress")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                current_phase: agent
+                    .get("current_phase")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                active_skill: agent
+                    .get("active_skill")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                queued: agent.get("queued").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                urgent_count: agent
+                    .get("urgent_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+                normal_count: agent
+                    .get("normal_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+                background_count: agent
+                    .get("background_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+                completed: agent.get("completed").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                owned_files: agent
+                    .get("owned_files")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize,
+                weighted_load: agent
+                    .get("weighted_load")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                // Per-agent financial cost from the daemon (USD). Absent → unknown.
+                cost: get_opt_f64(&agent, "cost_usd"),
+                budget: get_opt_f64(&agent, "budget_usd"),
+            })
+            .collect(),
+        recent_events: status
+            .get("recent_events")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        alerts: Vec::new(),
+        peers: status
+            .get("peers")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        total_cost: get_f64(&status, "total_cost_usd"),
+        budget_cap: get_f64(&status, "budget_cap_usd"),
+        mesh_throughput: get_f64(&status, "mesh_throughput_mb_s"),
+        total_vram_gb: get_f64(&status, "total_vram_gb"),
+        attention_budget: status
+            .get("attention_budget")
+            .cloned()
+            .filter(|v| !v.is_null()),
+    }
+}
+
+async fn enrich_mesh_from_tool(gui: &mut GuiOrchestratorStatus, daemon: &PersistentDaemon) {
+    let mesh = call_orchestrator_daemon(
+        daemon,
+        orch_daemon_method::TOOL_CALL,
+        serde_json::json!({ "name": "vox_mesh_nodes", "args": {} }),
+    )
+    .await;
+    if let Ok(value) = mesh {
+        let nodes = value
+            .get("result")
+            .or(Some(&value))
+            .and_then(|r| r.get("nodes"))
+            .and_then(|n| n.as_array());
+        if let Some(nodes) = nodes {
+            gui.peers = nodes.clone();
+            gui.total_vram_gb = nodes
+                .iter()
+                .filter_map(|n| n.get("vram_gb").and_then(|v| v.as_f64()))
+                .sum();
+        }
+    }
+}
+
+const GAMIFY_NOTIFICATIONS_TOOL: &str = "vox_gamify_notifications_list";
+const GAMIFY_ALERT_LIMIT: u32 = 20;
+
+#[derive(serde::Deserialize)]
+struct GamifyNotifications {
+    notifications: Vec<vox_gamify::notifications::Notification>,
+}
+
+/// Unread gamify notifications mapped to the `LudusBanner` alert shape (`{id, level, title,
+/// body}`). Best-effort: any error — including `exposure_denied` from a remote server, where the
+/// tool is dev-only — yields no alerts.
+pub(crate) async fn gamify_alerts<B: crate::remote::calls::BackendCalls>(
+    b: &B,
+) -> Vec<serde_json::Value> {
+    let args = serde_json::json!({ "limit": GAMIFY_ALERT_LIMIT });
+    let Ok(envelope) = b.call_tool(GAMIFY_NOTIFICATIONS_TOOL, args).await else {
+        return Vec::new();
+    };
+    let Ok(data) =
+        crate::remote::calls::tool_data::<GamifyNotifications>(GAMIFY_NOTIFICATIONS_TOOL, envelope)
+    else {
+        return Vec::new();
+    };
+    data.notifications
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "level": crate::commands::gamify::notification_level(&n.notification_type),
+                "title": n.title,
+                "body": n.message,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn get_orchestrator_status(
+    daemon: tauri::State<'_, Arc<PersistentDaemon>>,
+    backend: tauri::State<'_, Arc<crate::remote::backend::BackendState>>,
+) -> Result<serde_json::Value, String> {
+    let status = daemon_status(&daemon).await?;
+    let mut gui = to_gui_status(status);
+    if gui.peers.is_empty() {
+        enrich_mesh_from_tool(&mut gui, &daemon).await;
+    }
+    gui.alerts = gamify_alerts(&backend.current().await).await;
+    serde_json::to_value(gui).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_orchestrator_status_bin(
+    daemon: tauri::State<'_, Arc<PersistentDaemon>>,
+    backend: tauri::State<'_, Arc<crate::remote::backend::BackendState>>,
+) -> Result<tauri::ipc::Response, String> {
+    let status = daemon_status(&daemon).await?;
+    let mut gui = to_gui_status(status);
+    if gui.peers.is_empty() {
+        enrich_mesh_from_tool(&mut gui, &daemon).await;
+    }
+    gui.alerts = gamify_alerts(&backend.current().await).await;
+    let bytes = rmp_serde::to_vec_named(&gui).map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub async fn set_orchestrator_config(
+    app_handle: tauri::AppHandle,
+    config: serde_json::Value,
+    daemon: tauri::State<'_, Arc<PersistentDaemon>>,
+) -> Result<(), String> {
+    // 1. Discover Vox.toml
+    let current_dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (mut manifest, path) = VoxManifest::discover(&current_dir).map_err(|e| e.to_string())?;
+
+    // 2. Parse incoming JSON overrides into the orchestrator table
+    let mut orch_table = manifest.orchestrator.unwrap_or_default();
+
+    if let Some(c) = config.get("concurrency").and_then(|v| v.as_u64()) {
+        orch_table.insert("max_agents".to_string(), toml::Value::Integer(c as i64));
+    }
+    if let Some(cap) = config.get("capUsd").and_then(|v| v.as_f64()) {
+        // Convert USD to micros
+        orch_table.insert(
+            "financial_cost_budget_micros".to_string(),
+            toml::Value::Integer((cap * 1_000_000.0) as i64),
+        );
+    }
+    if let Some(doubt) = config.get("doubtThresh").and_then(|v| v.as_f64()) {
+        orch_table.insert(
+            "trust_auto_approve_min".to_string(),
+            toml::Value::Float(doubt),
+        );
+    }
+    if let Some(iso) = config.get("isolation").and_then(|v| v.as_str()) {
+        let val = if iso == "wasm" {
+            "Wasm"
+        } else if iso == "ctr" {
+            "Container"
+        } else {
+            "Native"
+        };
+        orch_table.insert(
+            "scope_enforcement".to_string(),
+            toml::Value::String(val.to_string()),
+        );
+    }
+    if let Some(auto) = config.get("autobudget").and_then(|v| v.as_bool()) {
+        orch_table.insert(
+            "exec_time_budget_enabled".to_string(),
+            toml::Value::Boolean(auto),
+        );
+    }
+    if let Some(shadow) = config.get("doubt").and_then(|v| v.as_bool()) {
+        orch_table.insert(
+            "socrates_gate_shadow".to_string(),
+            toml::Value::Boolean(!shadow),
+        );
+        orch_table.insert(
+            "socrates_gate_enforce".to_string(),
+            toml::Value::Boolean(shadow),
+        );
+    }
+    // Scaling section (Track D): local-resource-aware auto-scaling controls.
+    if let Some(v) = config.get("scalingEnabled").and_then(|v| v.as_bool()) {
+        orch_table.insert("scaling_enabled".to_string(), toml::Value::Boolean(v));
+    }
+    if let Some(v) = config
+        .get("harnessIssueDetectionEnabled")
+        .and_then(|v| v.as_bool())
+    {
+        orch_table.insert(
+            "harness_issue_detection_enabled".to_string(),
+            toml::Value::Boolean(v),
+        );
+    }
+    if let Some(v) = config.get("minAgents").and_then(|v| v.as_u64()) {
+        orch_table.insert("min_agents".to_string(), toml::Value::Integer(v as i64));
+    }
+    if let Some(v) = config.get("scalingThreshold").and_then(|v| v.as_u64()) {
+        orch_table.insert(
+            "scaling_threshold".to_string(),
+            toml::Value::Integer(v as i64),
+        );
+    }
+    if let Some(v) = config.get("scaleCpuCeilingPct").and_then(|v| v.as_f64()) {
+        orch_table.insert("scale_cpu_ceiling_pct".to_string(), toml::Value::Float(v));
+    }
+    if let Some(v) = config.get("scaleMemFloorMb").and_then(|v| v.as_u64()) {
+        orch_table.insert(
+            "scale_mem_floor_mb".to_string(),
+            toml::Value::Integer(v as i64),
+        );
+    }
+    if let Some(v) = config.get("chatResearchEnabled").and_then(|v| v.as_bool()) {
+        orch_table.insert("chat_research_enabled".to_string(), toml::Value::Boolean(v));
+        let _ = vox_secrets::store_secret(
+            vox_secrets::SecretId::VoxChatResearchEnabled,
+            if v { "true" } else { "false" },
+            None,
+        );
+    }
+
+    // 3. Save it back
+    manifest.orchestrator = Some(orch_table);
+    let toml_str = manifest.to_toml_string().map_err(|e| e.to_string())?;
+    std::fs::write(&path, toml_str).map_err(|e| e.to_string())?;
+
+    // 3b. Bump the vox-config snapshot so caches are invalidated and the
+    //     `vox://orchestrator-config-changed` listener fires on the GUI side.
+    vox_config::snapshot::bump(&[
+        "max_agents",
+        "financial_cost_budget_micros",
+        "trust_auto_approve_min",
+        "scope_enforcement",
+        "exec_time_budget_enabled",
+        "socrates_gate_enforce",
+        "scaling_enabled",
+        "min_agents",
+        "scaling_threshold",
+        "scale_cpu_ceiling_pct",
+        "scale_mem_floor_mb",
+        "harness_issue_detection_enabled",
+        "chat_research_enabled",
+    ]);
+    // Also emit the event directly so the GUI updates immediately even if the
+    // snapshot listener fires before the Tauri event loop processes the callback.
+    let _ = app_handle.emit(
+        ORCH_CONFIG_CHANGED_EVENT,
+        OrchestratorConfigChanged {
+            rev: vox_config::snapshot::current_rev(),
+        },
+    );
+
+    // 4. Try to signal vox-orchestrator-d to hot-reload if it is running
+    // We do this in a fire-and-forget manner to not block or fail the UI update.
+    let daemon: Arc<PersistentDaemon> = daemon.inner().clone();
+    tokio::spawn(async move {
+        let _ = call_orchestrator_daemon(
+            &daemon,
+            orch_daemon_method::RELOAD_CONFIG,
+            serde_json::json!({}),
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+/// Tauri event channel the frontend subscribes to for reactive Orchestrator
+/// settings refresh — emitted whenever the orchestrator config snapshot is bumped.
+pub const ORCH_CONFIG_CHANGED_EVENT: &str = "vox://orchestrator-config-changed";
+
+/// Payload for [`ORCH_CONFIG_CHANGED_EVENT`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorConfigChanged {
+    /// Monotonic snapshot revision at the time of the bump.
+    pub rev: u64,
+}
+
+/// Spawn once at GUI startup: forward `vox-config` snapshot bumps that affect
+/// orchestrator config keys to the webview as [`ORCH_CONFIG_CHANGED_EVENT`],
+/// so the Orchestrator settings surface refreshes reactively when config
+/// changes — whether from this GUI, an env reload, or mesh sync.
+///
+/// Mirrors [`crate::commands::user_config::spawn_llm_config_bridge`] (the B2
+/// pattern). Listeners are cheap synchronous callbacks; the Tauri emit is
+/// non-blocking so this satisfies the `vox-config` snapshot contract.
+// toestub-ignore(skeleton/untested-pub-api) — thin bridge from vox-config snapshot bumps to Tauri events; snapshot invalidation logic is tested in vox-config
+pub fn spawn_orchestrator_config_watch(app: tauri::AppHandle) {
+    vox_config::snapshot::on_change(move |change| {
+        // Only forward bumps that are a general reload (empty keys) or that
+        // contain at least one orchestrator key. This prevents spurious
+        // full-catalog refetches triggered by unrelated bumps such as LLM
+        // config changes or EnvScratch::drop.
+        let is_orch = change.changed.is_empty()
+            || change.changed.iter().any(|k| {
+                k.starts_with("VOX_ORCHESTRATOR_") || k.starts_with("VOX_CIRCUIT_BREAKER_")
+            });
+        if is_orch {
+            let _ = app.emit(
+                ORCH_CONFIG_CHANGED_EVENT,
+                OrchestratorConfigChanged { rev: change.rev },
+            );
+        }
+    });
+}
+
+/// Return all orchestrator config fields as structured metadata so the frontend
+/// can render the settings dynamically without hardcoded lists (Band B.3).
+///
+/// Each entry carries: key, label, field_type, current_value, default_value,
+/// group, and description — everything the UI needs to build a settings form.
+#[tauri::command]
+pub async fn get_orchestrator_config_catalog() -> Vec<vox_orchestrator::OrchestratorConfigField> {
+    vox_orchestrator::config::OrchestratorConfig::snapshot().to_catalog()
+}
+
+/// Current per-task-type policy overrides, straight from the effective
+/// `OrchestratorConfig` snapshot (env/project/user-merged, matching every
+/// other orchestrator-settings read in this file).
+#[tauri::command]
+pub fn get_task_policy_overrides() -> vox_orchestrator::config::TaskPolicyOverrides {
+    vox_orchestrator::config::OrchestratorConfig::snapshot().task_policy
+}
+
+/// `ClutchProfile`/`RiskPosture` already derive `Serialize` with
+/// `#[serde(rename_all = "snake_case")]`, so holding them directly (rather
+/// than hand-rolling a second string mapping) can't drift from the wire
+/// format each already produces on its own.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DefaultTaskPolicyDto {
+    pub clutch: vox_orchestrator::mode::ClutchProfile,
+    pub risk: vox_orchestrator::mode::RiskPosture,
+}
+
+/// The composer's real starting clutch/risk for `task_category` — the same
+/// precedence chain (`resolve_task_policy`) the backend uses when actually
+/// executing a task with no explicit hint, so the GUI's shown default can
+/// never drift from what would actually happen. `category` is any string
+/// `TaskCategory::from_str` accepts (case-insensitive, never errors — falls
+/// back to `General`); `source` is a `TriggerSource::from_label` string
+/// (`"interactive"`/`"automated"`/`"subagent"`/`"mesh"`, case-insensitive) —
+/// an unrecognized `source` falls back to `Interactive` via the same
+/// `unwrap_or(TriggerSource::Interactive)` pattern `resolved_policy()` uses
+/// elsewhere, not a parse error.
+#[tauri::command]
+pub fn resolve_default_task_policy(category: String, source: String) -> DefaultTaskPolicyDto {
+    use vox_orchestrator::mode::TriggerSource;
+    use vox_orchestrator::types::{AgentTask, TaskCategory, TaskId, TaskPriority};
+
+    let overrides = vox_orchestrator::config::OrchestratorConfig::snapshot().task_policy;
+    let category: TaskCategory = category.parse().unwrap_or_default();
+    let source = TriggerSource::from_label(&source).unwrap_or(TriggerSource::Interactive);
+
+    // A throwaway, never-submitted task carrying only the two axes this
+    // preview needs — routes through the SAME AgentTask::resolved_policy()
+    // real task execution uses, so this can't drift from the backend's
+    // actual precedence resolution the way a hand-rolled second copy could.
+    let mut preview_task = AgentTask::new(TaskId(0), "", TaskPriority::Normal, Vec::new());
+    preview_task.task_category = category;
+    preview_task.trigger_source = Some(source);
+    let (clutch, risk) = preview_task.resolved_policy(&overrides);
+    DefaultTaskPolicyDto { clutch, risk }
+}
+
+#[cfg(test)]
+mod default_policy_tests {
+    use super::*;
+
+    #[test]
+    fn chat_default_matches_resolve_task_policy_with_no_overrides() {
+        let dto = resolve_default_task_policy("Chat".to_string(), "interactive".to_string());
+        // No overrides configured in a fresh test environment ⇒ falls all the
+        // way to the global default, exactly like resolve_task_policy(None, None, None, None, None, None).
+        assert_eq!(dto.clutch, vox_orchestrator::mode::ClutchProfile::Balanced);
+        assert_eq!(dto.risk, vox_orchestrator::mode::RiskPosture::Moderate);
+    }
+
+    #[test]
+    fn unknown_category_or_source_labels_fall_back_to_global_default() {
+        // TaskCategory::from_str never errors (falls back to General for an
+        // unrecognized string), so this exercises "recognized category with no
+        // configured policy," not a parse failure — still must land on the
+        // same global default since nothing is configured for General either.
+        let dto = resolve_default_task_policy(
+            "NotARealCategory".to_string(),
+            "not_a_real_source".to_string(),
+        );
+        assert_eq!(dto.clutch, vox_orchestrator::mode::ClutchProfile::Balanced);
+        assert_eq!(dto.risk, vox_orchestrator::mode::RiskPosture::Moderate);
+    }
+}
+
+/// Reject unparseable clutch/risk labels before touching Vox.toml. `None`
+/// values are always accepted (that axis just isn't being set/changed).
+fn validate_task_policy_labels(clutch: Option<&str>, risk: Option<&str>) -> Result<(), String> {
+    if let Some(c) = clutch {
+        vox_orchestrator::mode::ClutchProfile::from_label(c)
+            .ok_or_else(|| format!("unknown clutch label: {c}"))?;
+    }
+    if let Some(r) = risk {
+        vox_orchestrator::mode::RiskPosture::from_label(r)
+            .ok_or_else(|| format!("unknown risk label: {r}"))?;
+    }
+    Ok(())
+}
+
+/// Shared plumbing for [`set_task_policy_override`] and
+/// [`clear_task_policy_override`]: read the current `[orchestrator.task_policy.<scope_kind>]`
+/// table, let `mutate` update it in place, write the manifest back, bump the
+/// config snapshot, emit the change event, and fire-and-forget signal the
+/// running orchestrator daemon to reload — exactly like `set_orchestrator_config`
+/// does, without which a write only affects what a future daemon restart
+/// picks up, not the live process. `mutate` receives the scope's CURRENT
+/// table so a caller can merge onto a pre-existing entry rather than
+/// replacing it wholesale.
+fn mutate_task_policy_scope(
+    app_handle: &tauri::AppHandle,
+    daemon: &Arc<PersistentDaemon>,
+    scope_kind: String,
+    mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
+) -> Result<(), String> {
+    let current_dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let (mut manifest, path) = VoxManifest::discover(&current_dir).map_err(|e| e.to_string())?;
+    let mut orch_table = manifest.orchestrator.unwrap_or_default();
+
+    let mut task_policy_table = orch_table
+        .get("task_policy")
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    let mut scope_table = task_policy_table
+        .get(&scope_kind)
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+
+    mutate(&mut scope_table);
+
+    task_policy_table.insert(scope_kind, toml::Value::Table(scope_table));
+    orch_table.insert(
+        "task_policy".to_string(),
+        toml::Value::Table(task_policy_table),
+    );
+
+    manifest.orchestrator = Some(orch_table);
+    let toml_str = manifest.to_toml_string().map_err(|e| e.to_string())?;
+    std::fs::write(&path, toml_str).map_err(|e| e.to_string())?;
+
+    vox_config::snapshot::bump(&["task_policy"]);
+    let _ = app_handle.emit(
+        ORCH_CONFIG_CHANGED_EVENT,
+        OrchestratorConfigChanged {
+            rev: vox_config::snapshot::current_rev(),
+        },
+    );
+
+    // Fire-and-forget: tell the running daemon to reload so this override
+    // affects real task execution immediately, not just after a restart.
+    let daemon = daemon.clone();
+    tokio::spawn(async move {
+        let _ = call_orchestrator_daemon(
+            &daemon,
+            orch_daemon_method::RELOAD_CONFIG,
+            serde_json::json!({}),
+        )
+        .await;
+    });
+
+    Ok(())
+}
+
+/// Merge `clutch`/`risk` into `scope_table`'s entry for `scope_key`,
+/// preserving whichever axis isn't being set (rather than replacing the
+/// entry wholesale) — `None` means "don't change this axis," not "clear it."
+fn merge_task_policy_entry(
+    scope_table: &mut toml::map::Map<String, toml::Value>,
+    scope_key: &str,
+    clutch: Option<&str>,
+    risk: Option<&str>,
+) {
+    let mut entry = scope_table
+        .get(scope_key)
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(c) = clutch {
+        entry.insert("clutch".to_string(), toml::Value::String(c.to_string()));
+    }
+    if let Some(r) = risk {
+        entry.insert("risk".to_string(), toml::Value::String(r.to_string()));
+    }
+    scope_table.insert(scope_key.to_string(), toml::Value::Table(entry));
+}
+
+/// `scope_kind` is `"category"` or `"source"`; `scope_key` is a `TaskCategory`/
+/// `TriggerSource` Debug name (e.g. `"CodeGen"`, `"Automated"`). Merges onto
+/// any pre-existing entry rather than replacing it wholesale, so passing only
+/// one of `clutch`/`risk` (leaving the other `None`, meaning "don't change
+/// this axis") can't silently drop the other axis's stored value.
+#[tauri::command]
+pub async fn set_task_policy_override(
+    app_handle: tauri::AppHandle,
+    scope_kind: String,
+    scope_key: String,
+    clutch: Option<String>,
+    risk: Option<String>,
+    daemon: tauri::State<'_, Arc<PersistentDaemon>>,
+) -> Result<(), String> {
+    validate_task_policy_labels(clutch.as_deref(), risk.as_deref())?;
+    let daemon = daemon.inner().clone();
+    mutate_task_policy_scope(&app_handle, &daemon, scope_kind, move |scope_table| {
+        merge_task_policy_entry(scope_table, &scope_key, clutch.as_deref(), risk.as_deref());
+    })
+}
+
+/// Remove one override (`scope_kind`/`scope_key` as in [`set_task_policy_override`]).
+/// Same daemon-reload signal as `set_task_policy_override`.
+#[tauri::command]
+pub async fn clear_task_policy_override(
+    app_handle: tauri::AppHandle,
+    scope_kind: String,
+    scope_key: String,
+    daemon: tauri::State<'_, Arc<PersistentDaemon>>,
+) -> Result<(), String> {
+    let daemon = daemon.inner().clone();
+    mutate_task_policy_scope(&app_handle, &daemon, scope_kind, move |scope_table| {
+        scope_table.remove(&scope_key);
+    })
+}
+
+#[cfg(test)]
+mod task_policy_tests {
+    use super::*;
+
+    #[test]
+    fn get_task_policy_overrides_reflects_snapshot() {
+        let overrides = get_task_policy_overrides();
+        // Fresh default config has no overrides yet.
+        assert!(overrides.category.is_empty());
+        assert!(overrides.source.is_empty());
+    }
+
+    #[test]
+    fn set_task_policy_override_rejects_unparseable_labels() {
+        let result = validate_task_policy_labels(Some("turbo"), Some("high"));
+        assert!(
+            result.is_err(),
+            "an unparseable clutch label must be rejected before writing Vox.toml"
+        );
+    }
+
+    #[test]
+    fn set_task_policy_override_accepts_valid_labels() {
+        let result = validate_task_policy_labels(Some("free"), Some("high"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn merge_task_policy_entry_preserves_the_untouched_axis() {
+        // Regression test: an earlier version replaced the entry wholesale
+        // from only the passed clutch/risk, silently dropping whichever axis
+        // was `None` even if a value for it already existed.
+        let mut scope_table = toml::map::Map::new();
+        let mut existing = toml::map::Map::new();
+        existing.insert(
+            "clutch".to_string(),
+            toml::Value::String("free".to_string()),
+        );
+        existing.insert("risk".to_string(), toml::Value::String("high".to_string()));
+        scope_table.insert("CodeGen".to_string(), toml::Value::Table(existing));
+
+        merge_task_policy_entry(&mut scope_table, "CodeGen", Some("genius"), None);
+
+        let entry = scope_table
+            .get("CodeGen")
+            .and_then(|v| v.as_table())
+            .expect("entry must still exist");
+        assert_eq!(entry.get("clutch").and_then(|v| v.as_str()), Some("genius"));
+        assert_eq!(
+            entry.get("risk").and_then(|v| v.as_str()),
+            Some("high"),
+            "risk must survive a clutch-only update"
+        );
+    }
+
+    #[test]
+    fn merge_task_policy_entry_creates_a_fresh_entry_when_none_exists() {
+        let mut scope_table = toml::map::Map::new();
+        merge_task_policy_entry(&mut scope_table, "Automated", Some("free"), Some("low"));
+        let entry = scope_table
+            .get("Automated")
+            .and_then(|v| v.as_table())
+            .expect("entry must exist");
+        assert_eq!(entry.get("clutch").and_then(|v| v.as_str()), Some("free"));
+        assert_eq!(entry.get("risk").and_then(|v| v.as_str()), Some("low"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use vox_orchestrator::config::OrchestratorConfig;
+
+    #[test]
+    fn catalog_len_matches_config_field_count() {
+        let catalog = OrchestratorConfig::default().to_catalog();
+        // Exact parity test: catalog must have exactly 107 entries — one per
+        // field! macro invocation in to_catalog(). Using an exact count rather
+        // than a floor catches catalog shrinkage as well as unintentional growth.
+        // If you intentionally add or remove fields, update this count to match.
+        assert_eq!(
+            catalog.len(),
+            107,
+            "catalog field count changed — update this test if fields were intentionally added/removed"
+        );
+    }
+
+    #[test]
+    fn catalog_keys_are_unique() {
+        let catalog = OrchestratorConfig::default().to_catalog();
+        let mut keys: Vec<&str> = catalog.iter().map(|f| f.key.as_str()).collect();
+        keys.sort_unstable();
+        let orig_len = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), orig_len, "catalog contains duplicate keys");
+    }
+
+    #[test]
+    fn catalog_default_matches_config_default() {
+        let catalog = OrchestratorConfig::default().to_catalog();
+        let max_agents_field = catalog.iter().find(|f| f.key == "max_agents").unwrap();
+        let default_cfg = OrchestratorConfig::default();
+        let expected = serde_json::json!(default_cfg.max_agents);
+        assert_eq!(
+            max_agents_field.current_value, expected,
+            "current_value for max_agents must match OrchestratorConfig::default().max_agents"
+        );
+        assert_eq!(
+            max_agents_field.default_value, expected,
+            "default_value for max_agents must match OrchestratorConfig::default().max_agents"
+        );
+    }
+}
+
+#[cfg(test)]
+mod orchestrator_config_toggle_tests {
+    // Mirrors the JSON-camelCase-to-TOML-snake_case mapping applied in
+    // set_orchestrator_config for the scaling_enabled sibling field, for
+    // harness_issue_detection_enabled.
+    #[test]
+    fn harness_issue_detection_enabled_maps_to_snake_case_toml_key() {
+        let config = serde_json::json!({"harnessIssueDetectionEnabled": false});
+        let mut orch_table = toml::map::Map::new();
+        if let Some(v) = config
+            .get("harnessIssueDetectionEnabled")
+            .and_then(|v| v.as_bool())
+        {
+            orch_table.insert(
+                "harness_issue_detection_enabled".to_string(),
+                toml::Value::Boolean(v),
+            );
+        }
+        assert_eq!(
+            orch_table.get("harness_issue_detection_enabled"),
+            Some(&toml::Value::Boolean(false))
+        );
+    }
+}
+
+/// Read the effective orchestrator settings (Vox.toml + env overrides) via
+/// [`OrchestratorConfig::snapshot`] so the GUI always reflects the live effective
+/// value rather than only the Vox.toml defaults (fixes the inert-sliders bug).
+#[tauri::command]
+pub async fn get_orchestrator_config() -> Result<serde_json::Value, String> {
+    let cfg = vox_orchestrator::config::OrchestratorConfig::snapshot();
+    let isolation = match cfg.scope_enforcement {
+        vox_orchestrator::scope::ScopeEnforcement::Strict => "strict",
+        vox_orchestrator::scope::ScopeEnforcement::Warn => "warn",
+        vox_orchestrator::scope::ScopeEnforcement::Disabled => "disabled",
+    };
+    Ok(serde_json::json!({
+        "concurrency": cfg.max_agents,
+        "capUsd": cfg.financial_cost_budget_micros as f64 / 1_000_000.0,
+        "doubtThresh": cfg.trust_auto_approve_min,
+        "isolation": isolation,
+        "autobudget": cfg.exec_time_budget_enabled,
+        "doubt": cfg.socrates_gate_enforce,
+        "scalingEnabled": cfg.scaling_enabled,
+        "harnessIssueDetectionEnabled": cfg.harness_issue_detection_enabled,
+        "minAgents": cfg.min_agents,
+        "scalingThreshold": cfg.scaling_threshold,
+        "scaleCpuCeilingPct": cfg.scale_cpu_ceiling_pct,
+        "scaleMemFloorMb": cfg.scale_mem_floor_mb,
+        "chatResearchEnabled": vox_orchestrator::is_chat_research_enabled(),
+    }))
+}
+
+#[cfg(test)]
+mod secretary_tests {
+    use super::*;
+
+    #[test]
+    fn secretary_proposed_payload_serializes() {
+        let payload = SecretaryProposedPayload {
+            item_id: "abc123".to_string(),
+            intent: "Fix the auth bug in login module".to_string(),
+            confidence_pct: 85,
+            session_id: "session-1".to_string(),
+        };
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(json["item_id"], "abc123");
+        assert_eq!(json["confidence_pct"], 85);
+        assert_eq!(json["session_id"], "session-1");
+    }
+}
+
+#[cfg(test)]
+mod gui_status_tests {
+    use super::*;
+
+    #[test]
+    fn gui_status_passes_through_attention_budget() {
+        let raw = serde_json::json!({
+            "agent_count": 0, "total_queued": 0, "total_in_progress": 0,
+            "total_completed": 0, "total_doubted": 0,
+            "attention_budget": { "max_attention_ms": 3_600_000, "spent_ms": 1_800_000,
+                "total_requests": 0, "auto_approved": 0, "rejected": 0,
+                "interrupt_freq_per_hour": 9.0, "last_interrupt_ms": 0, "inbox_suppressed_count": 0 }
+        });
+        let gui = to_gui_status(raw);
+        let ab = gui.attention_budget.expect("budget passed through");
+        assert_eq!(ab["spent_ms"], 1_800_000);
+    }
+
+    #[tokio::test]
+    async fn gamify_alerts_map_notifications_and_swallow_errors() {
+        use crate::remote::calls::fake::FakeBackend;
+        let b = FakeBackend::new().on_tool(
+            GAMIFY_NOTIFICATIONS_TOOL,
+            Ok(
+                serde_json::json!({ "success": true, "data": { "notifications": [{
+                "id": "n1", "user_id": "u", "notification_type": "StreakLost",
+                "title": "t", "message": "m", "read": false, "created_at": 0
+            }] } }),
+            ),
+        );
+        let alerts = gamify_alerts(&b).await;
+        assert_eq!(
+            alerts,
+            vec![serde_json::json!({ "id": "n1", "level": "warn", "title": "t", "body": "m" })]
+        );
+        assert_eq!(b.calls()[0].1["limit"], GAMIFY_ALERT_LIMIT);
+
+        let denied = FakeBackend::new().on_tool(
+            GAMIFY_NOTIFICATIONS_TOOL,
+            Ok(serde_json::json!({ "error": { "code": "exposure_denied", "message": "dev only" } })),
+        );
+        assert!(gamify_alerts(&denied).await.is_empty());
+        assert!(gamify_alerts(&FakeBackend::new()).await.is_empty());
+    }
+}

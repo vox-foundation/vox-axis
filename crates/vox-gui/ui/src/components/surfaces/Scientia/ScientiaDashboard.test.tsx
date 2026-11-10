@@ -1,0 +1,51 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import React from 'react';
+
+// The dashboard fetches a queue snapshot + cost rollup via native commands
+// that read through the app's own DB pool (no more execute_command subprocess).
+const SNAP = {
+  candidates: { total: 3, by_class: { perf: 2 }, top_5_by_confidence: [] },
+  claims_pending: { verifiable: 1, abstained: 0, extraction_running: 0 },
+  manifests_in_reply_window: [],
+  retraction_queue: [],
+  stalls: [],
+};
+const COST = { this_quarter: { total_usd: 0 }, by_provider: [], per_finding_average_usd: 0 };
+const invokeMock = vi.fn((cmd: string) => {
+  if (cmd === 'scientia_dashboard_snapshot') return Promise.resolve(SNAP);
+  if (cmd === 'scientia_cost_rollup') return Promise.resolve(COST);
+  return Promise.resolve({});
+});
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
+}));
+vi.mock('../../../transport', () => ({
+  listenScientiaQueue: vi.fn().mockRejectedValue(new Error('not in tauri')),
+}));
+vi.mock('./ArchiveStatusSummary', () => ({
+  ArchiveStatusSummary: () => React.createElement('div', { 'data-testid': 'archive-status-summary' }),
+}));
+
+import { LanguageProvider } from '../../../hooks/useLanguage';
+import { ScientiaDashboard } from './ScientiaDashboard';
+
+describe('ScientiaDashboard', () => {
+  beforeEach(() => {
+    cleanup();
+    invokeMock.mockClear();
+  });
+
+  it('Refresh control is an explicit type="button"', async () => {
+    render(<LanguageProvider><ScientiaDashboard pushToast={vi.fn()} /></LanguageProvider>);
+    const btn = await screen.findByRole('button', { name: /refresh/i });
+    expect(btn.getAttribute('type')).toBe('button');
+  });
+
+  it('includes the archive status summary panel', async () => {
+    render(<LanguageProvider><ScientiaDashboard pushToast={vi.fn()} /></LanguageProvider>);
+    await waitFor(() => {
+      expect(screen.getByTestId('archive-status-summary')).toBeTruthy();
+    });
+  });
+});

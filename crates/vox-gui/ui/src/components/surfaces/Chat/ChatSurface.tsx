@@ -1,0 +1,1804 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { sanitizeErrorForToast } from '../../../lib/backendGuard';
+import { invoke } from '@tauri-apps/api/core';
+import { type UnlistenFn } from '@tauri-apps/api/event';
+import { ChatTranscript } from './ChatTranscript';
+import type { StreamItem } from '../../../types/dashboard';
+import { EmptyState } from '../../ui/EmptyState';
+import { Icon } from '../../ui/Icons';
+import {
+  ChatExecutionRail,
+  countCompletedTurns,
+  DEFAULT_SESSION_CONTEXT_PINS,
+  type ChatExecutionTask,
+  type SessionContextPin,
+} from './ChatExecutionRail';
+import type { RailRouting } from '../../../lib/routingSummary';
+import { PlanPanel, type PlanNodeView } from './PlanPanel';
+import { listPlanNodes } from '../../../transport';
+import { labelForNavKey } from '../../../lib/navigation';
+import { WORKBENCH_TABBAR_TRAILING_SLOT_ID } from '../../../lib/domIds';
+import type { ChatMessage } from '../../../lib/chatCorrelation';
+import type { AttentionBudgetSnapshot, Toast } from '../../../types/tauri';
+import { AttentionBudgetMeter } from '../AttentionBudgetMeter';
+import { SecretaryToast } from './SecretaryToast';
+import { listenSecretaryProposed, type SecretaryProposedPayload, feedbackList } from '../../../transport';
+import { Matrix } from '../Matrix/Matrix';
+import { ModelsView } from '../Models/ModelsView';
+import { DockWorkspaceShell, layoutStorageKeyFor } from '../../dock/DockWorkspaceShell';
+import type { DockviewApi, IDockviewPanelProps, IDockviewPanelHeaderProps } from 'dockview';
+import { NeedsYouSurface } from '../NeedsYou/NeedsYouSurface';
+import type { AttentionInbox } from '../../../hooks/useAttentionInbox';
+import { VoxGraphStatusPanel } from '../VoxGraph/VoxGraphStatusPanel';
+import { DiscoverySurface } from '../Discovery/DiscoverySurface';
+import { RepositoryView } from '../Repository/RepositoryView';
+import { Mercatus } from '../Mercatus/Mercatus';
+import { HarnessRedirect } from '../Harness/HarnessRedirect';
+import { getPermissionMode } from '../../../transport';
+import { ResearchView } from '../Research/ResearchView';
+import { BrowserView } from '../Browser/BrowserView';
+import { LudusSandbox } from '../../gamify/LudusSandbox';
+import { EmbeddedSurfaceProvider } from '../../dashboard/EmbeddedSurfaceContext';
+import { useStore } from 'zustand';
+import { useLudusStore } from '../../gamify/store';
+import { Tooltip } from '../../ui/Tooltip';
+import {
+  getTerminalBridgeState,
+  subscribeTerminalBridge,
+  type TerminalBridgeState,
+} from '../../../lib/terminalBridge';
+import {
+  ALWAYS_CORE_DOCK_PANEL_IDS as ALWAYS_CORE,
+  CORE_DOCK_PANEL_IDS as CORE_PANEL_IDS,
+  OPT_IN_DOCK_PANEL_IDS as OPT_IN_PANEL_IDS,
+  type CoreDockPanelId as CorePanelId,
+  type OptInDockPanelId as OptInPanelId,
+} from '../../../lib/cvSurfaceDiscovery';
+
+// Chat transcript is the primary work surface (and, since Task 9 removed the
+// Sessions dockview panel, the dock's leftmost/anchor panel too). It gets a
+// hard floor (`minimumWidth`) so opening more panels to its right can never
+// squeeze it below a usable width, and no `maximumWidth` so it keeps
+// dockview's default fill/grow behavior for whatever room the row leaves it.
+//
+// dockview-core@6.6.1's real constraint mechanism, read from the shipped
+// type defs (not guessed):
+//   - `AddPanelOptions` = `... & Partial<Contraints>` — dockview-core
+//     dist/esm/dockview/options.d.ts:303, where `Contraints` (dockview's own
+//     spelling) is imported from gridview/gridviewPanel.d.ts:9-14:
+//     `{ minimumWidth?: number; maximumWidth?: number; minimumHeight?: number;
+//     maximumHeight?: number }` — plain pixel numbers, not percentages.
+//   - The same fields are settable post-creation via
+//     `panel.api.setConstraints({ minimumWidth, maximumWidth })` —
+//     dockview-core dist/esm/api/gridviewPanelApi.d.ts:22-23
+//     (`setConstraints(value: GridConstraintChangeEvent2): void`, where
+//     GridConstraintChangeEvent2 at gridviewPanelApi.d.ts:11-14 allows
+//     `FunctionOrValue<number>`, still resolving to a concrete pixel number
+//     at layout time — not a live "% of container" binding). DockviewPanelApi
+//     inherits this from GridviewPanelApi (dockview/dockviewPanelApi.d.ts:20).
+const TRANSCRIPT_MIN_WIDTH_PX = 460;
+
+// Passed straight into `addPanel`'s `Partial<Contraints>` fields (see above)
+// for every call site that creates this panel — onReady's initial create and
+// addDefaultPanel's Panels-menu/Reset-layout create both funnel through this
+// single map so the constraint values live in exactly one place.
+const PANEL_SIZE_CONSTRAINTS: Partial<
+  Record<string, { initialWidth?: number; maximumWidth?: number; minimumWidth?: number }>
+> = {
+  transcript: { minimumWidth: TRANSCRIPT_MIN_WIDTH_PX },
+};
+
+// Opt-in panels get NO auto-create branch in the refresh effect — only a
+// guarded `.update()` if already present — so they can only ever be (re)created
+// via the Panels menu's Add section, never resurrected on an unrelated re-render.
+
+interface CondensableSurfaceProps {
+  condensed?: boolean;
+}
+
+function cloneWithCondensed(node: React.ReactNode, condensed: boolean): React.ReactNode {
+  return React.isValidElement<CondensableSurfaceProps>(node)
+    ? React.cloneElement(node, { condensed })
+    : node;
+}
+
+function ResearchDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  return <div data-testid="chat-dock-research" className="h-full overflow-y-auto p-2">{props.params.node}</div>;
+}
+
+export function UrbsDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  return <div data-testid="chat-dock-urbs" className="h-full overflow-hidden p-1.5">{props.params.node}</div>;
+}
+
+export function BrowserDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  return <div data-testid="chat-dock-browser" className="h-full overflow-y-auto p-2">{props.params.node}</div>;
+}
+
+function TranscriptPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  return <div data-testid="chat-dock-transcript" className="flex h-full min-w-0 flex-col overflow-hidden p-2">{props.params.node}</div>;
+}
+
+function ExecutionRailPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  return <div data-testid="chat-dock-execution-rail" className="h-full overflow-y-auto">{props.params.node}</div>;
+}
+
+function TodosDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  return <div data-testid="chat-dock-todos" className="h-full overflow-y-auto p-2">{props.params.node}</div>;
+}
+
+// Needs You's approval/question/withheld lists need real room per the
+// original audit (~260-280px); condensed content reuses the same
+// needsYou+withheld+approvals total NeedsYouSurface already tallies.
+const NEEDS_YOU_FULL_WIDTH_PX = 270;
+
+export function NeedsYouDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+  const condensed = width < NEEDS_YOU_FULL_WIDTH_PX;
+  return (
+    <div data-testid="chat-dock-needs-you" className="h-full overflow-y-auto p-2">
+      {cloneWithCondensed(props.params.node, condensed)}
+    </div>
+  );
+}
+
+// Search Index's per-corpus cards need real room per the original audit
+// (~220-260px); condensed content reuses the same is_fresh flag each card
+// already renders as its Fresh/Stale pill, rolled up into "N/M fresh".
+const VOXGRAPH_FULL_WIDTH_PX = 240;
+
+export function VoxGraphDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+  const condensed = width < VOXGRAPH_FULL_WIDTH_PX;
+  return (
+    <div data-testid="chat-dock-voxgraph" className="h-full overflow-y-auto p-2">
+      {cloneWithCondensed(props.params.node, condensed)}
+    </div>
+  );
+}
+
+// Discovery's four nested surfaces (Timeline/Inbox/Review/Archive) each need
+// real room per the original audit (~360px); condensed content reuses the
+// same active-preset state the tab strip already tracks, naming which
+// preset is selected instead of mounting its (wide) nested surface.
+const ACTIVITY_FULL_WIDTH_PX = 360;
+
+export function ActivityDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+  const condensed = width < ACTIVITY_FULL_WIDTH_PX;
+  return (
+    <div data-testid="chat-dock-activity" className="h-full overflow-y-auto p-2">
+      {cloneWithCondensed(props.params.node, condensed)}
+    </div>
+  );
+}
+
+// Repository's action-button grid + command output pane need real room per
+// the original audit (~260-300px); condensed content reuses the same
+// active-conflict count IsolationPanel's own "Active conflicts" section
+// already computes via conflictRows(status).
+const REPOSITORY_FULL_WIDTH_PX = 280;
+
+export function RepositoryDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+  const condensed = width < REPOSITORY_FULL_WIDTH_PX;
+  return (
+    <div data-testid="chat-dock-repository" className="h-full overflow-y-auto p-2">
+      {cloneWithCondensed(props.params.node, condensed)}
+    </div>
+  );
+}
+
+// Mercatus's coverage matrix + source registry tables need real horizontal
+// room per the original audit (~320-360px); condensed content reuses the
+// "{parts.length} parts · {N} enabled sources" line Mercatus itself already
+// computes and shows in its full view.
+const MERCATUS_FULL_WIDTH_PX = 340;
+
+export function MercatusDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+  const condensed = width < MERCATUS_FULL_WIDTH_PX;
+  return (
+    <div data-testid="chat-dock-mercatus" className="h-full overflow-y-auto p-2">
+      {cloneWithCondensed(props.params.node, condensed)}
+    </div>
+  );
+}
+
+const HARNESS_FULL_WIDTH_PX = 420;
+
+export function HarnessDockPanel(props: IDockviewPanelProps<{ node: React.ReactNode }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+  const condensed = width < HARNESS_FULL_WIDTH_PX;
+  return (
+    <div data-testid="chat-dock-harness" className="h-full overflow-y-auto p-2">
+      {cloneWithCondensed(props.params.node, condensed)}
+    </div>
+  );
+}
+
+// Approvals' working table needs ~850-1000px (4 fixed columns sum to 710px
+// before the description column gets room). Condensed content:
+// pending-approval count + current permission mode.
+const APPROVALS_FULL_WIDTH_PX = 850; // from the audit: 4 fixed columns sum to 710px before the description column gets room
+
+export function ApprovalsDockPanel(props: IDockviewPanelProps<{ pendingApprovals: number; permissionMode: string; onNavigate?: (viewKey: string) => void }>) {
+  const [width, setWidth] = React.useState(props.api.width);
+  React.useEffect(() => {
+    const disposable = props.api.onDidDimensionsChange(() => setWidth(props.api.width));
+    return () => disposable.dispose();
+  }, [props.api]);
+
+  return (
+    <div data-testid="chat-dock-approvals" className="h-full overflow-y-auto p-2 text-xs">
+      <div className="mb-2">{props.params.pendingApprovals} pending · {props.params.permissionMode}</div>
+      {width >= APPROVALS_FULL_WIDTH_PX ? (
+        <a
+          role="link"
+          href="#"
+          onClick={e => { e.preventDefault(); props.params.onNavigate?.('approvals'); }}
+          className="text-brass hover:underline"
+        >
+          Open full view
+        </a>
+      ) : null}
+    </div>
+  );
+}
+
+export function TerminalDockPanel(props: IDockviewPanelProps<{ onNavigate?: (viewKey: string) => void }>) {
+  const [termState, setTermState] = useState<TerminalBridgeState>(() => getTerminalBridgeState());
+  useEffect(() => {
+    return subscribeTerminalBridge(setTermState);
+  }, []);
+
+  return (
+    <div data-testid="chat-dock-terminal" className="flex h-full flex-col overflow-hidden p-2 text-xs">
+      <div className="flex items-center justify-between border-b border-border-subtle pb-1.5 font-mono text-[11px]">
+        <div className="flex items-center gap-1.5">
+          <span className="font-semibold text-(--color-status-info)">
+            {termState.activeSessionId ? `term:${termState.activeSessionId}` : 'term:ready'}
+          </span>
+          <span className="text-text-muted">· {termState.blocks.length} blocks</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => props.params.onNavigate?.('console')}
+          className="text-brass hover:underline"
+        >
+          Open Console
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto pt-2 font-mono text-[11px] text-text-secondary">
+        {termState.blocks.length === 0 ? (
+          <div className="text-center text-text-muted">No terminal blocks recorded yet.</div>
+        ) : (
+          termState.blocks.slice(-5).map((block) => (
+            <div key={block.id} className="mb-2 rounded border border-border-subtle bg-overlay-subtle p-1.5">
+              <div className="font-semibold text-text-primary">$ {block.input}</div>
+              <pre className="max-h-20 overflow-y-auto whitespace-pre-wrap text-[11px] text-text-muted">
+                {block.output.map((c) => c.text).join('')}
+              </pre>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+const CHAT_DOCK_COMPONENTS = {
+  transcript: TranscriptPanel,
+  executionRail: ExecutionRailPanel,
+  todos: TodosDockPanel,
+  'needs-you': NeedsYouDockPanel,
+  voxgraph: VoxGraphDockPanel,
+  activity: ActivityDockPanel,
+  repository: RepositoryDockPanel,
+  mercatus: MercatusDockPanel,
+  harness: HarnessDockPanel,
+  approvals: ApprovalsDockPanel,
+  research: ResearchDockPanel,
+  terminal: TerminalDockPanel,
+  urbs: UrbsDockPanel,
+  browser: BrowserDockPanel,
+};
+
+// Marker rendered inside the transcript panel's dockview tab element. Task
+// 1.8 pinned the transcript panel by giving it this empty tab component,
+// which removes the visible tab/close chrome — but dockview-core 6.6.1 sets
+// `draggable = true` unconditionally on every tab's DOM element
+// (dockview-core/dist/esm/dockview/components/tab/tab.js), with no per-panel
+// API to disable it. The marker below gives the capture-phase `dragstart`
+// listener (see the `dockRootRef` effect in ChatSurface) a way to identify
+// "this drag started from the transcript panel's tab" purely from the DOM,
+// without a blanket `disableDnd` that would break dragging every other panel.
+// Renders a real, visible, non-interactive title (matching the default tab's
+// text styling) in place of dockview's own close/drag chrome — Task 1.8
+// suppressed that chrome entirely (see the comment block above) but left
+// nothing standing in for it, so the transcript's tab looked blank/broken.
+// The marker span (data-testid) is unchanged and still the thing the
+// dragstart-suppression listener below keys off of via `.dv-tab`
+// `querySelector`.
+function EmptyTab(props: IDockviewPanelHeaderProps) {
+  return (
+    <span
+      data-testid="chat-dock-transcript-tab-marker"
+      className="flex h-full items-center px-3 text-xs font-medium text-text-secondary"
+    >
+      {props.api.title ?? 'Chat'}
+    </span>
+  );
+}
+const CHAT_DOCK_TAB_COMPONENTS = { transcript: EmptyTab };
+
+interface ChatSurfaceProps {
+  pushToast: (t: Toast) => void;
+  onNavigate?: (viewKey: string) => void;
+  messages?: ChatMessage[];
+  activeSessionId?: string;
+  onSessionChange?: (sessionId: string) => void;
+  tasks?: ChatExecutionTask[];
+  routing?: RailRouting | null;
+  sessionSpentUsd?: number | null;
+  agentStreamItems?: StreamItem[];
+  /** Primary Loquela composer — embedded when global shell dock is hidden on Chat. */
+  composer?: React.ReactNode;
+  focusedFeedbackId?: string | null;
+  gamifyEnabled?: boolean;
+  attention_budget?: AttentionBudgetSnapshot | null;
+  waitingQuestions?: number;
+  blockedTasks?: number;
+  /** Live plan-DAG identity for this session, if the current task has synthesized a plan. */
+  planSessionId?: string | null;
+  planVersion?: number | null;
+  onDiscardPlan?: () => void;
+  /** Shared attention inbox (App owns polling) — sources the opt-in Needs You dock panel. */
+  attention?: AttentionInbox;
+  onOpenFeedbackContext?: (id: string) => void;
+  /** Pending-approval count — sources the opt-in Approvals dock panel's condensed badge (App.tsx: `attention.approvals.length`). */
+  pendingApprovals?: number;
+  /** Currently pinned skill id (App.tsx `activeSkill`), threaded into secretary task submission. */
+  activeSkillId?: string | null;
+  /** "not this one" on a skill-activation chip — see `ChatTranscript`/`ChatTurnEventRow`. */
+  onExcludeSkill?: (skillId: string) => void;
+}
+
+export function ChatSurface({
+  pushToast,
+  onNavigate,
+  messages = [],
+  activeSessionId,
+  onSessionChange,
+  tasks = [],
+  routing,
+  sessionSpentUsd,
+  agentStreamItems,
+  composer,
+  focusedFeedbackId,
+  gamifyEnabled,
+  attention_budget,
+  waitingQuestions = 0,
+  blockedTasks = 0,
+  planSessionId,
+  planVersion,
+  onDiscardPlan,
+  attention,
+  onOpenFeedbackContext,
+  pendingApprovals = 0,
+  activeSkillId,
+  onExcludeSkill,
+}: ChatSurfaceProps) {
+  // Task 9: session switching lives in the global Sidebar
+  // (SessionSidebarSection) now, backed by App.tsx's single owning call to
+  // useChatSessions. ChatSurface no longer needs session CRUD locally.
+  const [secretaryToast, setSecretaryToast] = useState<SecretaryProposedPayload | null>(null);
+  const activeId = activeSessionId ?? '';
+  const [planNodes, setPlanNodes] = useState<PlanNodeView[]>([]);
+  // dockview's `addPanel` captures `params` at call time — it does not track
+  // React re-renders. Keep a handle to the ready API so each panel's `node`
+  // param can be refreshed whenever the underlying content changes (new
+  // sessions loaded, transcript updated, execution rail data changed, etc).
+  const dockApiRef = useRef<DockviewApi | null>(null);
+  // Tracks panels removed (by the user's tab-close, or by the reset action
+  // below) so the refresh effect below can tell "not yet ready to create"
+  // apart from "the user closed this — leave it closed until something
+  // explicitly asks for it back." Cleared per-id by the reopen/reset actions
+  // (Tasks 4/5), not by this effect.
+  const closedPanelIds = useRef<Set<string>>(new Set());
+  // Mirrors which dock panels are currently open, purely to drive the Panels
+  // menu's checkbox `checked` state. dockApiRef is a live ref, not React
+  // state — reading `!!dockApiRef.current?.getPanel(id)` directly at render
+  // time only stays correct if a render happens to observe it. Two calls to
+  // dockApiRef mutators (addPanel/removePanel) back-to-back with no React
+  // render in between never get reconciled onto the controlled checkbox's
+  // DOM node, and panels closed via a route other than the checkbox (tab-close
+  // action, Reset layout) never trigger a render at all, leaving a stale
+  // checked=true. This state is the single source of truth the checkboxes
+  // read from; it is kept in sync both by the onChange handler (synchronously,
+  // for the common case) and by dockview's own onDidAddPanel/onDidRemovePanel
+  // events (for external changes).
+  const [openPanelIds, setOpenPanelIds] = useState<Set<string>>(() => new Set());
+  // Tracks the order opt-in panels were (most-recently) activated in, so a
+  // newly-opened opt-in panel positions itself next to the last one the user
+  // opened rather than always inserting at the same fixed referenceChain
+  // slot. Core panels keep their existing fixed-position behavior — this
+  // only affects OPT_IN_PANEL_IDS.
+  const activationOrderRef = useRef<string[]>([]);
+  const autoOpenedTodosRef = useRef(false);
+  const prevPlanKeyRef = useRef<string | null>(null);
+
+  const [routingOpen, setRoutingOpen] = useState(false);
+  const [routingDrawerTab, setRoutingDrawerTab] = useState<'matrix' | 'models'>('matrix');
+  const [panelsMenuOpen, setPanelsMenuOpen] = useState(false);
+  const panelsTriggerRef = useRef<HTMLButtonElement | null>(null);
+  // The popover content itself (checkboxes, Reset layout) — separate from
+  // panelsTriggerRef, which only covers the trigger button. The outside-close
+  // listener below must treat clicks inside *either* as "inside": it
+  // previously checked only the trigger, so a mousedown on any checkbox (not
+  // contained by the trigger) closed the menu before the click's onChange
+  // could fire, making every checkbox in the popover unclickable.
+  const panelsMenuRef = useRef<HTMLDivElement | null>(null);
+  const dockRootRef = useRef<HTMLDivElement | null>(null);
+
+  // The Panels ▾ trigger used to render in its own shrink-0 row above the
+  // dock workspace, costing a full row of vertical height for one small
+  // control. It was then portaled into WorkbenchTabBar's own trailing slot,
+  // but that coupled the trigger's visibility to the tab bar's wrap state:
+  // with many top-level tabs open the tablist wraps to multiple lines and
+  // the trigger could end up on whichever line wrapped last, effectively
+  // "scrolled off"/unreachable. BottomStatusBar (rendered by the app shell
+  // above ChatSurface, one level up the tree — not a descendant, and *not* inside
+  // the tab bar's own wrapping flex row) now exposes a fixed DOM node
+  // (`#workbench-tabbar-trailing-slot`) as a portal target so the button
+  // sits inline with persistent app chrome instead — a single-line, never-
+  // wrapping row that exists independently of the tab bar (which is slated
+  // for eventual removal). Looked up on mount rather than assumed present so
+  // ChatSurface still renders correctly standalone (e.g. in tests that don't
+  // mount the app shell) — falling back to its own row in that case.
+  const [tabBarTrailingSlot, setTabBarTrailingSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    setTabBarTrailingSlot(document.getElementById(WORKBENCH_TABBAR_TRAILING_SLOT_ID));
+  }, []);
+
+  // Task 1.8 follow-up: dockview-core sets `draggable = true` on every tab
+  // element unconditionally, regardless of the (empty) tab component the
+  // transcript panel uses to hide its chrome. There is no dockview API to
+  // disable dragging for a single panel. A capture-phase `dragstart`
+  // listener on the dock's own root container preventDefault()s only when
+  // the drag originated from within a `.dv-tab` that contains the
+  // transcript panel's marker element (rendered by `EmptyTab` above) — every
+  // other panel's tab is untouched.
+  //
+  // Task 1 (drag-and-drop-to-reorder fix) follow-up: DockWorkspaceShell now
+  // sets `dndStrategy="pointer"` on `<DockviewReact>` to work around a
+  // WebView2 HTML5-drag-and-drop reliability issue. Under that strategy
+  // dockview never sets `draggable = true` and never dispatches a native
+  // `dragstart` — every drag (mouse included) is driven by dockview-core's
+  // `PointerDragSource` (see `dnd/pointer/pointerDragSource.js`), which:
+  //   1. on `pointerdown` (bubble listener on the tab element itself) just
+  //      *arms* — this same `pointerdown` is also how dockview activates a
+  //      clicked tab (`tabs.js`'s `tab.onPointerDown` calls
+  //      `group.model.openPanel(panel)`), so it must NOT be suppressed or
+  //      clicking the transcript tab to activate it would break too;
+  //   2. only becomes a real drag once a subsequent `pointermove` (a
+  //      *bubble* listener PointerDragSource adds dynamically to `window`)
+  //      exceeds a small distance threshold.
+  // So instead of blocking step 1, this tracks the `pointerId` of a
+  // pointerdown that started on the transcript tab, then swallows just that
+  // pointer's `pointermove` events via a *capture-phase* listener on
+  // `window`. Capture-phase listeners on `window` always run before
+  // same-type bubble-phase listeners also registered on `window` (capture
+  // is window's first pass over the event; bubble is its last), so
+  // `stopImmediatePropagation()` here reliably runs before — and prevents —
+  // PointerDragSource's own move handler, starving the drag of the motion
+  // it needs to cross its arm threshold. Tab click-to-activate is
+  // unaffected since pointerdown itself is never touched.
+  useEffect(() => {
+    const root = dockRootRef.current;
+    if (!root) return;
+    const isTranscriptTabEvent = (event: Event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return false;
+      const tabEl = target.closest('.dv-tab');
+      if (!tabEl) return false;
+      return Boolean(tabEl.querySelector('[data-testid="chat-dock-transcript-tab-marker"]'));
+    };
+    const handleDragStart = (event: DragEvent) => {
+      if (isTranscriptTabEvent(event)) {
+        event.preventDefault();
+      }
+    };
+    let suppressedPointerId: number | null = null;
+    const handlePointerDown = (event: PointerEvent) => {
+      suppressedPointerId = isTranscriptTabEvent(event) ? event.pointerId : null;
+    };
+    const clearSuppressed = (event: PointerEvent) => {
+      if (event.pointerId === suppressedPointerId) {
+        suppressedPointerId = null;
+      }
+    };
+    const handlePointerMove = (event: PointerEvent) => {
+      if (suppressedPointerId !== null && event.pointerId === suppressedPointerId) {
+        event.stopImmediatePropagation();
+        event.preventDefault();
+      }
+    };
+    root.addEventListener('dragstart', handleDragStart, true);
+    root.addEventListener('pointerdown', handlePointerDown, true);
+    window.addEventListener('pointermove', handlePointerMove, true);
+    window.addEventListener('pointerup', clearSuppressed, true);
+    window.addEventListener('pointercancel', clearSuppressed, true);
+    return () => {
+      root.removeEventListener('dragstart', handleDragStart, true);
+      root.removeEventListener('pointerdown', handlePointerDown, true);
+      window.removeEventListener('pointermove', handlePointerMove, true);
+      window.removeEventListener('pointerup', clearSuppressed, true);
+      window.removeEventListener('pointercancel', clearSuppressed, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!routingOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setRoutingOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [routingOpen]);
+
+  useEffect(() => {
+    if (!panelsMenuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPanelsMenuOpen(false);
+        panelsTriggerRef.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [panelsMenuOpen]);
+
+  useEffect(() => {
+    if (!panelsMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (panelsTriggerRef.current?.contains(target)) return;
+      if (panelsMenuRef.current?.contains(target)) return;
+      setPanelsMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [panelsMenuOpen]);
+
+  // Task 9: "auto-select the first session" now lives in App.tsx, the sole
+  // owner of useChatSessions (see its initial-load effect around
+  // chat_list_sessions/{limit:1}) — this component no longer has its own
+  // sessions list to auto-select from.
+
+  useEffect(() => {
+    if (!planSessionId || planVersion == null) {
+      setPlanNodes([]);
+      return;
+    }
+    let cancelled = false;
+    listPlanNodes(planSessionId, planVersion)
+      .then((rows: PlanNodeView[]) => {
+        if (!cancelled) setPlanNodes(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setPlanNodes([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [planSessionId, planVersion]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listenSecretaryProposed((payload) => {
+      setSecretaryToast(payload);
+    })
+      .then((fn) => {
+        if (cancelled) {
+          try { void Promise.resolve(fn()).catch(() => {}); } catch { /* ignore */ }
+          return;
+        }
+        unlisten = fn;
+      })
+      .catch(() => { /* ignore */ });
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        try { void Promise.resolve(unlisten()).catch(() => {}); } catch { /* ignore */ }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!focusedFeedbackId) return;
+    
+    feedbackList().then((data) => {
+      const allFeedback = [...data.needsYou, ...data.withheld];
+      const item = allFeedback.find((f) => f.feedbackId === focusedFeedbackId);
+      if (!item) return;
+
+      const match = messages.find((msg) => {
+        if (msg.taskId) {
+          const mTaskId = Number(msg.taskId);
+          if (item.gates.includes(mTaskId) || mTaskId === item.doubtedTaskId) {
+            return true;
+          }
+        }
+        return msg.text.includes(item.prompt);
+      });
+
+      if (match) {
+        const el = document.getElementById(`msg-${match.id}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          el.classList.add('ring-2', 'ring-(--color-status-warn)', 'ring-offset-2', 'ring-offset-zinc-950');
+          setTimeout(() => {
+            el.classList.remove('ring-2', 'ring-(--color-status-warn)', 'ring-offset-2', 'ring-offset-zinc-950');
+          }, 3000);
+        }
+      }
+    }).catch(() => {});
+  }, [focusedFeedbackId, messages]);
+
+
+
+  /**
+   * Submit a secretary-proposed task (Task 0.2: propose-only). This is the
+   * ONLY path by which a secretary classification becomes a live orchestrator
+   * task — invoked exclusively from the "Add task" button on `SecretaryToast`.
+   */
+  const confirmSecretaryTask = async (payload: SecretaryProposedPayload) => {
+    setSecretaryToast(null);
+    try {
+      await invoke('secretary_confirm_task', {
+        sessionId: payload.session_id,
+        intent: payload.intent,
+        activeSkill: activeSkillId ?? null,
+      });
+      onNavigate?.('tasks');
+    } catch (err) {
+      pushToast({ tone: 'warn', title: 'Add task failed', body: sanitizeErrorForToast(err), cause: 'backend-error' });
+    }
+  };
+
+  const executionRailNode = onNavigate ? (
+    <ChatExecutionRail
+      tasks={tasks}
+      routing={routing}
+      sessionSpentUsd={sessionSpentUsd}
+      sessionId={activeSessionId}
+      onOpenRouting={() => setRoutingOpen(true)}
+      onNavigate={onNavigate}
+      turnsCompleted={countCompletedTurns(messages)}
+    />
+  ) : null;
+
+  const todosNode = (
+    <PlanPanel
+      planSessionId={planSessionId}
+      planVersion={planVersion}
+      nodes={planNodes}
+      onDiscard={onDiscardPlan}
+    />
+  );
+
+  const needsYouNode = (
+    <NeedsYouSurface
+      onOpenContext={onOpenFeedbackContext ?? (() => {})}
+      pushToast={pushToast}
+      attention={attention}
+    />
+  );
+
+  const voxGraphNode = useMemo(() => <VoxGraphStatusPanel />, []);
+
+  const activityNode = useMemo(
+    () => <DiscoverySurface pushToast={pushToast} gamifyEnabled={gamifyEnabled} />,
+    [pushToast, gamifyEnabled],
+  );
+
+  const repositoryNode = useMemo(
+    () => <RepositoryView pushToast={pushToast} gamifyEnabled={gamifyEnabled} />,
+    [pushToast, gamifyEnabled],
+  );
+
+  const mercatusNode = useMemo(() => <Mercatus />, []);
+
+  const harnessNode = useMemo(
+    () => (
+      <HarnessRedirect
+        tasks={tasks}
+        messages={messages}
+        routing={routing}
+        sessionSpentUsd={sessionSpentUsd}
+        gamifyEnabled={gamifyEnabled}
+        onOpenRouting={() => setRoutingOpen(true)}
+      />
+    ),
+    [tasks, messages, routing, sessionSpentUsd, gamifyEnabled],
+  );
+
+  const researchNode = useMemo(
+    () => <ResearchView pushToast={pushToast} gamifyEnabled={gamifyEnabled} />,
+    [pushToast, gamifyEnabled],
+  );
+
+  const browserNode = useMemo(
+    () => <BrowserView pushToast={pushToast} gamifyEnabled={gamifyEnabled} />,
+    [pushToast, gamifyEnabled],
+  );
+
+  const [ludusEnergy, setLudusEnergy] = useState<{ energy: number; maxEnergy: number }>({
+    energy: 80,
+    maxEnergy: 100,
+  });
+  const [liveKbScope, setLiveKbScope] = useState<'auto' | 'verified' | 'off'>('auto');
+  const [liveOversight, setLiveOversight] = useState<string>('balanced');
+  const [kbBudgetCap, setKbBudgetCap] = useState<number>(1200);
+  const [kbPins, setKbPins] = useState<SessionContextPin[]>(DEFAULT_SESSION_CONTEXT_PINS);
+  const [editingKbPinId, setEditingKbPinId] = useState<string | null>(null);
+  const [editingKbPinDraft, setEditingKbPinDraft] = useState<string>('');
+  const [newKbPinInput, setNewKbPinInput] = useState<string>('');
+
+  useEffect(() => {
+    const onPinsSync = (ev: Event) => {
+      const custom = ev as CustomEvent<{ pins?: SessionContextPin[]; source?: string }>;
+      if (custom.detail?.source !== 'inspector' && Array.isArray(custom.detail?.pins)) {
+        setKbPins(custom.detail.pins);
+      }
+    };
+    window.addEventListener('vox:context-pins-change', onPinsSync);
+    return () => window.removeEventListener('vox:context-pins-change', onPinsSync);
+  }, []);
+
+  const syncKbPins = (next: SessionContextPin[]) => {
+    setKbPins(next);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('vox:context-pins-change', { detail: { pins: next, source: 'inspector' } }),
+      );
+    }
+  };
+
+  const handleKbScopePick = (scope: 'auto' | 'verified' | 'off') => {
+    setLiveKbScope(scope);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('vox:kb-scope-change', {
+          detail: { kbScope: scope, oversightLevel: liveOversight },
+        }),
+      );
+    }
+  };
+
+  const handleAddKbPin = () => {
+    const trimmed = newKbPinInput.trim();
+    if (!trimmed) return;
+    const formatted =
+      trimmed.startsWith('@') || trimmed.includes('/') || trimmed.includes('.')
+        ? trimmed
+        : `@kb:${trimmed}`;
+    syncKbPins([...kbPins, { id: `ctx-${Date.now()}`, label: formatted, scope: 'pinned' }]);
+    setNewKbPinInput('');
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('vox:atlas-mention', { detail: { token: formatted } }));
+    }
+  };
+
+  const handleCommitKbPinEdit = (id: string) => {
+    const trimmed = editingKbPinDraft.trim();
+    if (trimmed) {
+      syncKbPins(kbPins.map((p) => (p.id === id ? { ...p, label: trimmed } : p)));
+    }
+    setEditingKbPinId(null);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ energy?: number; max_energy?: number }>('get_ludus_profile')
+      .catch(() => invoke<{ energy?: number; max_energy?: number }>('gamify_profile'))
+      .then((prof) => {
+        if (!cancelled && prof && typeof prof.energy === 'number') {
+          setLudusEnergy({
+            energy: prof.energy,
+            maxEnergy: typeof prof.max_energy === 'number' && prof.max_energy > 0 ? prof.max_energy : 100,
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKbScopeChange = (ev: Event) => {
+      const custom = ev as CustomEvent<{ kbScope?: 'auto' | 'verified' | 'off'; oversightLevel?: string }>;
+      if (custom.detail?.kbScope) setLiveKbScope(custom.detail.kbScope);
+      if (custom.detail?.oversightLevel) setLiveOversight(custom.detail.oversightLevel);
+    };
+    window.addEventListener('vox:kb-scope-change', onKbScopeChange);
+    return () => window.removeEventListener('vox:kb-scope-change', onKbScopeChange);
+  }, []);
+
+  const urbsNode = useMemo(
+    () => (
+      <EmbeddedSurfaceProvider value={true}>
+        <LudusSandbox energy={ludusEnergy.energy} maxEnergy={ludusEnergy.maxEnergy} onNavigate={onNavigate} />
+      </EmbeddedSurfaceProvider>
+    ),
+    [ludusEnergy.energy, ludusEnergy.maxEnergy, onNavigate],
+  );
+
+  const estimatedKbTokens = useMemo(() => {
+    if (liveKbScope === 'off') return 0;
+    const msgChars = messages.reduce((sum, m) => sum + (m.text?.length ?? 0), 0);
+    const pinBonus = kbPins.length * 60;
+    return Math.min(kbBudgetCap, Math.max(120, 120 + pinBonus + Math.ceil(msgChars / 4)));
+  }, [messages, liveKbScope, kbPins.length, kbBudgetCap]);
+
+  const approvalsParams = {
+    pendingApprovals,
+    permissionMode: getPermissionMode() ?? 'ask',
+    onNavigate,
+  };
+
+  const [wrapUpDismissed, setWrapUpDismissed] = useState(false);
+  const [kbInspectorOpen, setKbInspectorOpen] = useState(false);
+  const [digestOpen, setDigestOpen] = useState(false);
+  const showHumaneWrapUp =
+    !wrapUpDismissed &&
+    Boolean(
+      attention_budget &&
+        (attention_budget.exhausted || attention_budget.alert_level === 'Critical'),
+    );
+
+  const centerContent = (
+    <>
+      {messages.length === 0 && !(agentStreamItems?.length ?? 0) ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <EmptyState
+            icon={<Icon.spark className="size-8 text-brass" aria-hidden="true" />}
+            title="No messages yet"
+            description="Describe a task in the composer below to start this session."
+            headingLevel={2}
+          />
+        </div>
+      ) : (
+        <ChatTranscript
+          messages={messages}
+          agentStreamItems={agentStreamItems}
+          sessionId={activeId}
+          onExcludeSkill={onExcludeSkill}
+        />
+      )}
+      {composer != null ? (
+        <div
+          className="mt-auto shrink-0 border-t border-border-subtle pt-3"
+          data-testid="chat-composer-dock"
+        >
+          {showHumaneWrapUp ? (
+            <div
+              data-testid="humane-session-wrapup-card"
+              role="region"
+              aria-label="Session wrap-up suggestion"
+              className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-brass/30 bg-brass/8 px-3 py-2 text-xs text-text-secondary"
+            >
+              <div>
+                <div className="font-display text-[11px] uppercase tracking-[0.13em] text-brass">
+                  Session Wrap-Up — Natural Stopping Point
+                </div>
+                <p className="mt-0.5 text-[11px] text-text-muted">
+                  {countCompletedTurns(messages)} turns completed. Take a break or start a fresh context window when ready — rest days never break your streak.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Dismiss session wrap-up"
+                onClick={() => setWrapUpDismissed(true)}
+                className="shrink-0 whitespace-nowrap rounded-md border border-border-subtle bg-overlay-subtle px-2 py-1 font-mono text-[11px] text-text-muted hover:text-text-primary"
+              >
+                Dismiss
+              </button>
+            </div>
+          ) : null}
+          {attention_budget ? (
+            <div className="mb-2 px-1" data-testid="chat-attention-meter">
+              <AttentionBudgetMeter
+                budget={attention_budget}
+                waitingQuestions={waitingQuestions}
+                blockedTasks={blockedTasks}
+                defaultCollapsed={
+                  !waitingQuestions &&
+                  !blockedTasks &&
+                  (attention_budget.max_attention_ms > 0
+                    ? attention_budget.spent_ms / attention_budget.max_attention_ms
+                    : 1) < 0.8
+                }
+              />
+            </div>
+          ) : null}
+          {composer}
+          {/* Compact KB Context Inspector & Attention Digest Strip (collapsed to sr-only by default since Pinned Context is unified in Execution Rail) */}
+          <div className={`${kbInspectorOpen || digestOpen ? 'mt-2 flex items-center justify-between gap-1.5 px-0.5 text-[11px]' : 'sr-only'}`}>
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+              <button
+                type="button"
+                data-testid="kb-context-inspector-toggle"
+                onClick={() => setKbInspectorOpen((o) => !o)}
+                className={
+                  kbInspectorOpen
+                    ? 'inline-flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded border border-border-subtle bg-overlay-subtle px-2 font-mono text-[11px] tracking-tight text-text-secondary transition hover:border-white/20 hover:text-text-primary'
+                    : 'sr-only'
+                }
+              >
+                <span className="size-1.5 rounded-full bg-brass" aria-hidden="true" />
+                <span>Pinned Context ({kbInspectorOpen ? 'hide' : `${kbPins.length} files`})</span>
+              </button>
+              <button
+                type="button"
+                data-testid="inbox-digest-toggle"
+                onClick={() => setDigestOpen((o) => !o)}
+                className={
+                  digestOpen
+                    ? 'inline-flex h-6 shrink-0 items-center gap-1.5 whitespace-nowrap rounded border border-border-subtle bg-overlay-subtle px-2 font-mono text-[11px] tracking-tight text-text-secondary transition hover:border-white/20 hover:text-text-primary'
+                    : 'sr-only'
+                }
+              >
+                <span className="size-1.5 rounded-full bg-(--color-status-info)" aria-hidden="true" />
+                <span>Attention Digest ({digestOpen ? 'hide' : `${waitingQuestions + blockedTasks} urgent`})</span>
+              </button>
+            </div>
+          </div>
+          {kbInspectorOpen ? (
+            <div
+              data-testid="kb-context-inspector-drawer"
+              className="mt-1.5 flex flex-col gap-1.5 rounded-lg border border-border-subtle bg-surface-elevated/40 px-3 py-2 font-mono text-[11px] text-text-secondary"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="font-semibold text-status-warning">
+                  Session-Pinned @kb Context Injection
+                </div>
+                <div className="flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="text-text-muted">Scope:</span>
+                  {(['auto', 'verified', 'off'] as const).map((scopeOpt) => (
+                    <button
+                      key={scopeOpt}
+                      type="button"
+                      data-testid={`kb-inspector-scope-${scopeOpt}`}
+                      onClick={() => handleKbScopePick(scopeOpt)}
+                      className={`whitespace-nowrap rounded border px-1.5 py-0.5 text-[11px] transition ${
+                        liveKbScope === scopeOpt
+                          ? 'border-brass/50 bg-brass/15 text-brass'
+                          : 'border-border-subtle bg-overlay-subtle text-text-muted hover:text-text-secondary'
+                      }`}
+                    >
+                      @kb:{scopeOpt}
+                    </button>
+                  ))}
+                  <span className="ml-1 text-text-muted">Cap:</span>
+                  <input
+                    type="number"
+                    min={200}
+                    max={8000}
+                    step={100}
+                    data-testid="kb-inspector-budget-input"
+                    aria-label="KB token budget cap"
+                    value={kbBudgetCap}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      if (!Number.isNaN(val) && val >= 200) setKbBudgetCap(val);
+                    }}
+                    className="w-16 rounded border border-border-subtle bg-overlay-subtle px-1.5 py-0.5 font-mono text-[11px] text-text-primary outline-hidden focus:border-brass/40"
+                  />
+                  <span className="text-text-muted">tok</span>
+                </div>
+              </div>
+              <div className="text-[11px] text-text-muted">
+                Budget: {estimatedKbTokens} / {kbBudgetCap.toLocaleString()} tok · Scope: @kb:{liveKbScope} · Oversight: {liveOversight} · Session turns: {messages.length}
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                {kbPins.map((pin) => {
+                  const isEditing = editingKbPinId === pin.id;
+                  return (
+                    <span
+                      key={pin.id}
+                      data-testid={`kb-inspector-pin-${pin.id}`}
+                      className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-brass/30 bg-brass/10 px-2 py-0.5 font-mono text-[11px] text-brass"
+                    >
+                      {isEditing ? (
+                        <input
+                          autoFocus
+                          data-testid="kb-inspector-pin-edit-input"
+                          aria-label={`Edit citation ${pin.label}`}
+                          value={editingKbPinDraft}
+                          onChange={(e) => setEditingKbPinDraft(e.target.value)}
+                          onBlur={() => handleCommitKbPinEdit(pin.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') handleCommitKbPinEdit(pin.id);
+                            if (e.key === 'Escape') setEditingKbPinId(null);
+                          }}
+                          className="w-40 rounded border border-brass/50 bg-surface-base/80 px-1 py-0.5 font-mono text-[11px] text-text-primary outline-hidden"
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          data-testid={`kb-inspector-pin-edit-${pin.id}`}
+                          aria-label={`Edit pinned context ${pin.label}`}
+                          onClick={() => {
+                            setEditingKbPinId(pin.id);
+                            setEditingKbPinDraft(pin.label);
+                          }}
+                          className="truncate max-w-[220px] whitespace-nowrap text-left hover:underline"
+                        >
+                          {pin.label}
+                          {pin.scope ? <span className="ml-1 text-text-muted">({pin.scope})</span> : null}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        data-testid={`kb-inspector-pin-remove-${pin.id}`}
+                        aria-label={`Remove pinned context ${pin.label}`}
+                        onClick={() => syncKbPins(kbPins.filter((p) => p.id !== pin.id))}
+                        className="ml-0.5 whitespace-nowrap text-text-muted hover:text-(--color-status-fail)"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+                <div className="inline-flex items-center gap-1">
+                  <input
+                    type="text"
+                    data-testid="kb-inspector-add-pin-input"
+                    aria-label="Add pinned context citation"
+                    placeholder="+ Pin @kb or file…"
+                    value={newKbPinInput}
+                    onChange={(e) => setNewKbPinInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleAddKbPin();
+                    }}
+                    className="w-36 rounded border border-border-subtle bg-overlay-subtle px-2 py-0.5 font-mono text-[11px] text-text-primary placeholder:text-text-muted outline-hidden focus:border-brass/40"
+                  />
+                  <button
+                    type="button"
+                    data-testid="kb-inspector-add-pin-btn"
+                    aria-label="Submit pinned context citation"
+                    onClick={handleAddKbPin}
+                    className="whitespace-nowrap rounded border border-brass/30 bg-brass/10 px-1.5 py-0.5 font-mono text-[11px] text-brass hover:bg-brass/20"
+                  >
+                    Pin
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          {digestOpen ? (
+            <div
+              data-testid="inbox-digest-panel"
+              className="mt-1.5 rounded-lg border border-border-subtle bg-surface-elevated/40 px-3 py-2 font-mono text-[11px] text-text-secondary"
+            >
+              <div className="font-semibold text-status-info">
+                Batched Attention Inbox Digest (Phase 18 · QueueForDigest)
+              </div>
+              <div className="mt-1 text-[11px] text-text-muted">
+                Low-priority background agent updates are batched here to protect deep-work focus. Hard safety-floor actions always prompt immediately.
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </>
+  );
+
+  // Supersedes the Task 1.4 CorePanelId-only alias now that opt-in panels exist.
+  type ChatDockPanelId = CorePanelId | OptInPanelId;
+
+  // `params` is each panel's dock-component params bag, uniformly. Most
+  // panels just wrap a single React node (`{ node: someNode }`), matched by
+  // their DockPanel component reading `props.params.node` — but a panel is
+  // free to define whatever shape its own DockPanel component expects
+  // (Approvals passes structured `{ pendingApprovals, permissionMode,
+  // onNavigate }` instead). This is the single source of truth for "what
+  // params does panel X get" — addDefaultPanel and the refresh effect below
+  // both read it, so there is exactly one definition per panel, not two.
+  const panelDefs: Record<ChatDockPanelId, { title: string; params: Record<string, unknown>; referenceChain: ChatDockPanelId[] }> = {
+    transcript: { title: 'Chat', params: { node: centerContent }, referenceChain: [] },
+    executionRail: { title: 'Execution', params: { node: executionRailNode }, referenceChain: ['transcript'] },
+    todos: { title: 'To-dos', params: { node: todosNode }, referenceChain: ['executionRail', 'transcript'] },
+    'needs-you': { title: labelForNavKey('needs-you'), params: { node: needsYouNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    // Titles for surfaces that also exist as top-level app tabs come from
+    // labelForNavKey (src/lib/navigation.ts), the app-wide breadcrumb/label
+    // SSOT — not hand-typed guesses. voxgraph's real label is "Search
+    // Index" (not "VoxGraph") and activity's is "Discovery" (not
+    // "Activity"); using the SSOT directly prevents this drifting again.
+    voxgraph: { title: labelForNavKey('vox-search'), params: { node: voxGraphNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    activity: { title: labelForNavKey('activity'), params: { node: activityNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    repository: { title: labelForNavKey('repository'), params: { node: repositoryNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    mercatus: { title: labelForNavKey('mercatus'), params: { node: mercatusNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    harness: { title: labelForNavKey('harness'), params: { node: harnessNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    // ApprovalsDockPanel takes structured params (pendingApprovals/
+    // permissionMode/onNavigate), never a rendered node, so it never mounts
+    // a second live <ApprovalsView> poll loop.
+    approvals: { title: labelForNavKey('approvals'), params: approvalsParams, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    research: { title: labelForNavKey('research'), params: { node: researchNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    terminal: { title: 'Terminal', params: { onNavigate }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    urbs: { title: 'Urbs Civilization', params: { node: urbsNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+    browser: { title: labelForNavKey('browser'), params: { node: browserNode }, referenceChain: ['todos', 'executionRail', 'transcript'] },
+  };
+
+  // Positions a newly-activated opt-in panel next to whichever opt-in panel
+  // was activated immediately before it, instead of always inserting at a
+  // fixed referenceChain slot. Falls back to the anchor chain (the same
+  // chain core panels use) only when no opt-in panel has been activated yet
+  // this session — or when the last-activated one is no longer open.
+  // Once this many opt-in panels are already sharing the row, a further one
+  // stacks BELOW the most-recently-activated panel instead of splitting the
+  // row right again — otherwise every additional opt-in panel keeps halving
+  // an already-thin row indefinitely. 2 keeps the existing "positions after
+  // the most-recently-activated opt-in panel" behavior intact for the first
+  // couple of opt-ins (see the addPanel-position regression test) and only
+  // changes behavior once a 3rd (and beyond) opt-in panel opens.
+  const OPT_IN_ROW_STACK_THRESHOLD = 2;
+
+  const positionForActivation = (
+    api: DockviewApi,
+    def: (typeof panelDefs)[ChatDockPanelId],
+  ): { direction: 'right' | 'below'; referencePanel: string } | undefined => {
+    const liveContainerWidth = dockRootRef.current?.clientWidth ?? 0;
+    const isCompactDesktop = liveContainerWidth > 0 && liveContainerWidth < 1560;
+    const last = activationOrderRef.current[activationOrderRef.current.length - 1];
+    if (last && api.getPanel(last)) {
+      const direction =
+        isCompactDesktop || activationOrderRef.current.length >= OPT_IN_ROW_STACK_THRESHOLD
+          ? 'below'
+          : 'right';
+      return { direction, referencePanel: last };
+    }
+    if (isCompactDesktop && api.getPanel('executionRail')) {
+      return { direction: 'below', referencePanel: 'executionRail' };
+    }
+    const anchor = def.referenceChain.find(candidateId => api.getPanel(candidateId));
+    return anchor ? { direction: 'right', referencePanel: anchor } : undefined;
+  };
+
+  // Plain function, not useCallback: panelDefs is a fresh object every render.
+  const addDefaultPanel = (api: DockviewApi, id: ChatDockPanelId) => {
+    const def = panelDefs[id];
+    const isOptIn = (OPT_IN_PANEL_IDS as readonly string[]).includes(id);
+    const position = isOptIn
+      ? positionForActivation(api, def)
+      : (() => {
+          const referencePanel = def.referenceChain.find(candidateId => api.getPanel(candidateId));
+          return referencePanel ? ({ direction: 'right', referencePanel } as const) : undefined;
+        })();
+    api.addPanel({
+      id,
+      component: id,
+      ...(id === 'transcript' ? { tabComponent: 'transcript' } : {}),
+      title: def.title,
+      params: def.params,
+      position,
+      ...(PANEL_SIZE_CONSTRAINTS[id] ?? {}),
+    });
+    closedPanelIds.current.delete(id);
+    if (id === 'todos') {
+      autoOpenedTodosRef.current = false;
+    }
+    if (isOptIn) {
+      activationOrderRef.current = [...activationOrderRef.current.filter(existing => existing !== id), id];
+    }
+  };
+
+  // Refresh each panel's `node` param on every render so dockview reflects
+  // the latest sessions/transcript/execution-rail content (addPanel only
+  // captures params once, at panel-creation time).
+  useEffect(() => {
+    const api = dockApiRef.current;
+    if (!api) return;
+    api.getPanel('transcript')?.update({ params: panelDefs.transcript.params });
+    const executionPanel = api.getPanel('executionRail');
+    if (executionRailNode) {
+      if (executionPanel) {
+        executionPanel.update({ params: panelDefs.executionRail.params });
+      } else if (!closedPanelIds.current.has('executionRail')) {
+        api.addPanel({
+          id: 'executionRail',
+          component: 'executionRail',
+          title: 'Execution',
+          params: panelDefs.executionRail.params,
+          position: { direction: 'right', referencePanel: 'transcript' },
+        });
+      }
+    } else if (executionPanel) {
+      api.removePanel(executionPanel);
+    }
+    const staleFlow = api.getPanel('flow');
+    if (staleFlow) {
+      staleFlow.api.close();
+      closedPanelIds.current.add('flow');
+    }
+    const todosPanel = api.getPanel('todos');
+    const hasLivePlan = planSessionId != null && planVersion != null;
+    const planKey = hasLivePlan ? `${planSessionId}:${planVersion}` : null;
+    if (prevPlanKeyRef.current !== planKey) {
+      if (hasLivePlan) {
+        closedPanelIds.current.delete('todos');
+      }
+      prevPlanKeyRef.current = planKey;
+    }
+    if (todosPanel) {
+      todosPanel.update({ params: panelDefs.todos.params });
+      if (!hasLivePlan && autoOpenedTodosRef.current) {
+        todosPanel.api.close();
+        closedPanelIds.current.delete('todos');
+        autoOpenedTodosRef.current = false;
+      }
+    } else if (hasLivePlan && !closedPanelIds.current.has('todos')) {
+      api.addPanel({
+        id: 'todos',
+        component: 'todos',
+        title: 'To-dos',
+        params: panelDefs.todos.params,
+        position: {
+          direction: 'right',
+          referencePanel: api.getPanel('executionRail') ? 'executionRail' : 'transcript',
+        },
+      });
+      autoOpenedTodosRef.current = true;
+    }
+    // Opt-in panels: update-only, no create branch. They can only be
+    // (re)created via the Panels menu's Add section (Step 4 below) — this is
+    // what makes the "resurrects after close" bug structurally impossible.
+    api.getPanel('needs-you')?.update({ params: panelDefs['needs-you'].params });
+    api.getPanel('voxgraph')?.update({ params: panelDefs.voxgraph.params });
+    api.getPanel('activity')?.update({ params: panelDefs.activity.params });
+    api.getPanel('repository')?.update({ params: panelDefs.repository.params });
+    api.getPanel('mercatus')?.update({ params: panelDefs.mercatus.params });
+    api.getPanel('harness')?.update({ params: panelDefs.harness.params });
+    api.getPanel('approvals')?.update({ params: panelDefs.approvals.params });
+    api.getPanel('research')?.update({ params: panelDefs.research.params });
+    api.getPanel('terminal')?.update({ params: panelDefs.terminal.params });
+    api.getPanel('urbs')?.update({ params: panelDefs.urbs.params });
+    api.getPanel('browser')?.update({ params: panelDefs.browser.params });
+  });
+
+  const applyWorkspacePreset = (presetPanels: ChatDockPanelId[]) => {
+    const api = dockApiRef.current;
+    if (!api) return;
+    const targetSet = new Set<string>(['transcript', ...presetPanels]);
+    api.panels.forEach((p) => {
+      if (!targetSet.has(p.id)) {
+        api.removePanel(p);
+        closedPanelIds.current.add(p.id);
+      }
+    });
+    const addedRightIds: ChatDockPanelId[] = [];
+    for (const id of presetPanels) {
+      if (id === 'executionRail' && !executionRailNode) continue;
+      const existing = api.getPanel(id);
+      if (existing) {
+        api.removePanel(existing);
+      }
+      const def = panelDefs[id];
+      const position =
+        addedRightIds.length === 0
+          ? ({ direction: 'right', referencePanel: 'transcript' } as const)
+          : addedRightIds.length === 1
+            ? ({ direction: 'below', referencePanel: addedRightIds[0]! } as const)
+            : ({ direction: 'within', referencePanel: addedRightIds[addedRightIds.length - 1]! } as const);
+      api.addPanel({
+        id,
+        component: id,
+        title: def.title,
+        params: def.params,
+        position,
+        ...(PANEL_SIZE_CONSTRAINTS[id] ?? {}),
+      });
+      closedPanelIds.current.delete(id);
+      addedRightIds.push(id);
+    }
+    setOpenPanelIds(new Set(api.panels.map((p) => p.id)));
+  };
+
+  const selectedDistrictFilter = useStore(useLudusStore, (s) => s.selectedDistrictFilter);
+
+  const toggleTacticalMapDock = () => {
+    const api = dockApiRef.current;
+    if (!api) return;
+    const existing = api.getPanel('urbs');
+    if (existing) {
+      api.removePanel(existing);
+      closedPanelIds.current.add('urbs');
+    } else {
+      const def = panelDefs.urbs;
+      const execPanel = api.getPanel('executionRail');
+      api.addPanel({
+        id: 'urbs',
+        component: 'urbs',
+        title: def.title,
+        params: def.params,
+        position: execPanel
+          ? { direction: 'above', referencePanel: 'executionRail' }
+          : { direction: 'right', referencePanel: 'transcript' },
+      });
+      closedPanelIds.current.delete('urbs');
+    }
+    setOpenPanelIds(new Set(api.panels.map((p) => p.id)));
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.altKey) && e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        toggleTacticalMapDock();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  const isFocusPreset = !openPanelIds.has('executionRail') && !openPanelIds.has('terminal') && !openPanelIds.has('harness') && !openPanelIds.has('urbs');
+  const isSplitPreset = openPanelIds.has('executionRail') && openPanelIds.has('terminal');
+  const isMultiPreset = openPanelIds.has('harness') || openPanelIds.has('urbs');
+  const isTacticalMapOpen = openPanelIds.has('urbs');
+
+  const layoutPresetsBar = (
+    <div
+      role="group"
+      aria-label="Quick workspace layout presets"
+      data-testid="chat-header-layout-presets"
+      className="inline-flex flex-wrap items-center gap-1 rounded-lg border border-border-subtle bg-overlay-solid/90 px-1.5 py-0.5 font-mono text-[11px]"
+    >
+      <span className="px-1 text-[11px] uppercase tracking-[0.08em] text-text-muted">Layout:</span>
+      <button
+        type="button"
+        data-testid="chat-header-preset-focus"
+        data-cv-subsurface="preset-focus"
+        onClick={() => applyWorkspacePreset([])}
+        className={`whitespace-nowrap rounded px-2 py-0.5 transition ${
+          isFocusPreset
+            ? 'border border-brass/50 bg-brass/18 text-brass font-medium shadow-xs'
+            : 'text-text-muted hover:bg-overlay-hover hover:text-brass'
+        }`}
+      >
+        Focus
+      </button>
+      <button
+        type="button"
+        data-testid="chat-header-preset-split"
+        data-cv-subsurface="preset-split"
+        onClick={() => applyWorkspacePreset(['executionRail', 'terminal'])}
+        className={`whitespace-nowrap rounded px-2 py-0.5 transition ${
+          isSplitPreset
+            ? 'border border-brass/50 bg-brass/18 text-brass font-medium shadow-xs'
+            : 'text-text-muted hover:bg-overlay-hover hover:text-brass'
+        }`}
+      >
+        Split Code
+      </button>
+      <button
+        type="button"
+        data-testid="chat-header-preset-multi"
+        data-cv-subsurface="preset-multi"
+        onClick={() => applyWorkspacePreset(['urbs', 'executionRail', 'harness'])}
+        className={`whitespace-nowrap rounded px-2 py-0.5 transition ${
+          isMultiPreset
+            ? 'border border-brass/50 bg-brass/18 text-brass font-medium shadow-xs'
+            : 'text-text-muted hover:bg-overlay-hover hover:text-brass'
+        }`}
+      >
+        Multi-Agent
+      </button>
+      <button
+        type="button"
+        data-testid="urbs-tactical-map-toggle"
+        onClick={toggleTacticalMapDock}
+        title="Toggle Split-Dock Tactical Map (⌘M / Alt+M)"
+        className={`whitespace-nowrap rounded px-2 py-0.5 transition ${
+          isTacticalMapOpen
+            ? 'border border-brass/60 bg-brass/20 text-brass font-medium shadow-xs'
+            : 'text-text-muted hover:bg-overlay-hover hover:text-brass'
+        }`}
+      >
+        🏛 Tactical Map ⌘M
+      </button>
+    </div>
+  );
+
+  const panelsMenu = (
+    <div className="flex items-center gap-1.5">
+      <div className="relative">
+      <Tooltip content="Toggle docked panels and workspace layout" side="top">
+        <button
+          ref={panelsTriggerRef}
+          type="button"
+          data-cv-popover-trigger="workspace-panels"
+          aria-label="Panels"
+          aria-expanded={panelsMenuOpen}
+          onClick={() => setPanelsMenuOpen(o => !o)}
+          className="rounded-lg border border-border-subtle bg-overlay-subtle px-2 py-1 text-text-muted transition hover:border-brass/40 hover:text-brass"
+        >
+          <span className="font-mono text-xs">Panels ▾</span>
+        </button>
+      </Tooltip>
+      {panelsMenuOpen ? (
+        <div
+          ref={panelsMenuRef}
+          role="group"
+          aria-label="Workspace panels"
+          className={`absolute right-0 ${tabBarTrailingSlot ? 'bottom-full mb-2' : 'top-full mt-1'} z-[99999] w-64 rounded-lg border border-border-subtle bg-bg-base p-1.5 shadow-2xl`}
+        >
+                <div className="px-2 py-1 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">
+                  Docked Panels
+                </div>
+                {[
+                  ...CORE_PANEL_IDS.filter(id => id !== 'executionRail' || executionRailNode != null),
+                  ...OPT_IN_PANEL_IDS,
+                ].map(id => {
+                  const isOpen = openPanelIds.has(id);
+                  return (
+                    <label
+                      key={id}
+                      className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 text-xs text-text-muted hover:bg-overlay-hover hover:text-text-primary"
+                    >
+                      <input
+                        type="checkbox"
+                        className="rounded-sm border-border-subtle bg-bg-base text-brass focus:ring-brass/40 focus:ring-offset-bg-base size-3.5"
+                        checked={isOpen}
+                        onChange={() => {
+                          const api = dockApiRef.current;
+                          if (!api) return;
+                          const panel = api.getPanel(id);
+                          if (panel) {
+                            api.removePanel(panel);
+                            closedPanelIds.current.add(id); // core panels still need this guard
+                          } else {
+                            addDefaultPanel(api, id);
+                          }
+                          // Synchronous, not reliant on dockview's own event
+                          // round-trip — so a second checkbox toggled
+                          // immediately after (no await in between) still
+                          // reads a correct, freshly-committed openPanelIds.
+                          setOpenPanelIds(prev => {
+                            const next = new Set(prev);
+                            if (panel) {
+                              next.delete(id);
+                            } else {
+                              next.add(id);
+                            }
+                            return next;
+                          });
+                        }}
+                      />
+                      {panelDefs[id].title}
+                    </label>
+                  );
+                })}
+                <div className="my-1 border-t border-border-subtle" />
+                <div className="px-2 py-1 font-mono text-[11px] uppercase tracking-[0.08em] text-text-muted">
+                  Layout Presets
+                </div>
+                <div className="grid grid-cols-3 gap-1 px-1 pb-1">
+                  <button
+                    type="button"
+                    data-testid="dock-preset-focus"
+                    onClick={() => applyWorkspacePreset([])}
+                    className="whitespace-nowrap rounded border border-border-subtle bg-overlay-subtle px-1.5 py-1 font-mono text-[11px] text-text-secondary hover:border-brass/40 hover:text-brass"
+                  >
+                    Focus
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="dock-preset-engineering"
+                    onClick={() => applyWorkspacePreset(['executionRail', 'terminal'])}
+                    className="whitespace-nowrap rounded border border-border-subtle bg-overlay-subtle px-1.5 py-1 font-mono text-[11px] text-text-secondary hover:border-brass/40 hover:text-brass"
+                  >
+                    Split
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="dock-preset-civilization"
+                    onClick={() => applyWorkspacePreset(['harness', 'urbs'])}
+                    className="whitespace-nowrap rounded border border-border-subtle bg-overlay-subtle px-1.5 py-1 font-mono text-[11px] text-text-secondary hover:border-brass/40 hover:text-brass"
+                  >
+                    Overview
+                  </button>
+                </div>
+                <div className="my-1 border-t border-border-subtle" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.localStorage.removeItem(layoutStorageKeyFor('gui.chat'));
+                    const api = dockApiRef.current;
+                    if (api) {
+                      api.panels.forEach(p => api.removePanel(p)); // .panels is a fresh snapshot per access — safe to iterate while removePanel mutates the underlying model
+                      closedPanelIds.current.clear();
+                      // ALWAYS_CORE only — To-dos is plan-gated (recreated below
+                      // when a live plan is attached). Opt-in panels are
+                      // intentionally NOT recreated by Reset.
+                      ALWAYS_CORE.filter(id => id !== 'executionRail' || executionRailNode != null).forEach(id =>
+                        addDefaultPanel(api, id),
+                      );
+                      if (planSessionId != null && planVersion != null) {
+                        addDefaultPanel(api, 'todos');
+                        autoOpenedTodosRef.current = true;
+                      }
+                      // addDefaultPanel doesn't update openPanelIds itself (it's
+                      // also called from onReady, before openPanelIds even
+                      // exists as a concept) — resync explicitly from the
+                      // dockview API's actual panel set post-reset.
+                      setOpenPanelIds(new Set(api.panels.map(p => p.id)));
+                    }
+                    setPanelsMenuOpen(false);
+                    panelsTriggerRef.current?.focus();
+                  }}
+                  className="block w-full rounded-sm px-2 py-1.5 text-left text-xs text-text-muted hover:bg-overlay-hover hover:text-text-primary"
+                >
+                  Reset layout
+                </button>
+              </div>
+            ) : null}
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      className="relative flex h-full gap-4"
+      data-testid="chat-surface-layout"
+    >
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div
+          data-testid="chat-top-header-bar"
+          className="mb-1.5 flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-lg border border-border-subtle/80 bg-overlay-solid/85 px-3 py-1.5"
+        >
+          <div className="flex min-w-0 items-center gap-2 font-mono text-xs">
+            <span className="text-text-muted">Chat</span>
+            <span className="text-text-muted">/</span>
+            <span className="truncate font-medium text-text-primary">
+              {activeId || 'Active Session'}
+            </span>
+            {selectedDistrictFilter && (
+              <button
+                type="button"
+                data-testid="urbs-district-filter-pill"
+                onClick={() => useLudusStore.getState().setSelectedDistrictFilter(null)}
+                className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-brass/50 bg-brass/15 px-2 py-0.5 font-mono text-[11px] font-medium text-brass hover:bg-brass/25"
+                title="Clear Urbs District Filter"
+              >
+                <span>🏛 District Filter: {selectedDistrictFilter}</span>
+                <span aria-hidden="true">×</span>
+              </button>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {layoutPresetsBar}
+            {!tabBarTrailingSlot ? panelsMenu : null}
+          </div>
+        </div>
+        {tabBarTrailingSlot ? createPortal(panelsMenu, tabBarTrailingSlot) : null}
+        <div ref={dockRootRef} className="min-h-0 flex-1">
+        <DockWorkspaceShell
+          storageKeyPrefix="gui.chat"
+          components={CHAT_DOCK_COMPONENTS}
+          tabComponents={CHAT_DOCK_TAB_COMPONENTS}
+          onReady={(event) => {
+            dockApiRef.current = event.api;
+            // Persisted-layout fallback (Task 9). Any user who used the Chat
+            // surface before the Sessions dockview panel was removed has a
+            // persisted `gui.chat` layout that still references a `sessions`
+            // panel whose `contentComponent` no longer exists in
+            // CHAT_DOCK_COMPONENTS. Verified empirically (not assumed) against
+            // dockview-core@6.6.1: DockWorkspaceShell's `event.api.fromJSON`
+            // call, which runs BEFORE this onReady handler, throws
+            // ("Dockview: Only React.memo(...), React.ForwardRef(...) and
+            // functional components are accepted as components") the instant
+            // it tries to construct a panel for an unregistered component id
+            // — it does NOT silently skip just that one panel. That throw is
+            // already caught by DockWorkspaceShell's own try/catch, which logs
+            // a warning and leaves the API on its fresh default (empty) grid,
+            // so `event.api.getPanel('sessions')` is always undefined by the
+            // time this handler runs — dockview's own error-handling already
+            // guarantees the stale panel can never surface. The explicit check
+            // below is kept as defense-in-depth (a future dockview version
+            // could change fromJSON to skip only the bad node instead of
+            // reverting the whole restore) and is exercised by the regression
+            // test "closes a stale 'sessions' panel restored from a persisted
+            // layout" in ChatSurface.test.tsx, which asserts on the
+            // user-visible outcome (no chat-dock-sessions node, transcript
+            // still mounts) rather than on this line executing.
+            const staleSessionsPanel = event.api.getPanel('sessions');
+            if (staleSessionsPanel) {
+              staleSessionsPanel.api.close();
+            }
+            const staleFlowPanel = event.api.getPanel('flow');
+            if (staleFlowPanel) {
+              staleFlowPanel.api.close();
+              closedPanelIds.current.add('flow');
+            }
+            // To-dos is plan-gated. A persisted layout can restore it (saved while
+            // a plan was live, e.g. before a Discard the debounced save never
+            // caught); mark it auto-opened so the refresh effect closes it when
+            // no live plan is attached, instead of showing an empty panel.
+            if (event.api.getPanel('todos')) {
+              autoOpenedTodosRef.current = true;
+            }
+            event.api.onDidRemovePanel(panel => {
+              closedPanelIds.current.add(panel.id);
+              // Keeps the Panels menu checkbox in sync when a panel closes
+              // through a route other than its own checkbox — dragging a tab
+              // closed, the tab's native close action, or Reset layout's bulk
+              // removePanel loop above. None of those call setOpenPanelIds
+              // directly, so without this listener the checkbox would stay
+              // visibly checked after the panel is actually gone.
+              setOpenPanelIds(prev => {
+                if (!prev.has(panel.id)) return prev;
+                const next = new Set(prev);
+                next.delete(panel.id);
+                return next;
+              });
+            });
+            event.api.onDidAddPanel(panel => {
+              // Symmetric case: a panel added by something other than the
+              // checkbox's own onChange (e.g. a restored layout from
+              // localStorage on mount, or the sessions/transcript/etc.
+              // auto-create branches below).
+              setOpenPanelIds(prev => {
+                if (prev.has(panel.id)) return prev;
+                const next = new Set(prev);
+                next.add(panel.id);
+                return next;
+              });
+            });
+            setOpenPanelIds(new Set(event.api.panels.map(p => p.id)));
+            // Guarded against duplicate-add: a restored dockview layout
+            // (ChatDockShell's localStorage persistence) already recreates
+            // these panels, so onReady must not re-add them.
+            if (!event.api.getPanel('transcript')) {
+              event.api.addPanel({
+                id: 'transcript',
+                component: 'transcript',
+                tabComponent: 'transcript',
+                title: 'Chat',
+                params: panelDefs.transcript.params,
+                // No `position` — Task 9 removed the Sessions panel that
+                // transcript used to anchor off of, so transcript is now
+                // added with no positional anchor, matching how Sessions
+                // itself used to be added (dockview places a panel with no
+                // `position` as the layout's default/leftmost panel).
+                ...PANEL_SIZE_CONSTRAINTS.transcript,
+              });
+            }
+            if (executionRailNode && !event.api.getPanel('executionRail')) {
+              const execPanel = event.api.addPanel({
+                id: 'executionRail',
+                component: 'executionRail',
+                title: 'Execution',
+                params: panelDefs.executionRail.params,
+                position: { direction: 'right', referencePanel: 'transcript' },
+              });
+              execPanel?.api?.setSize?.({ width: 340 });
+            }
+            const liveDockW = dockRootRef.current?.clientWidth ?? 0;
+            if (liveDockW > 0) {
+              const migratedV66 = window.localStorage.getItem('gui.chat.dockview_v66_2col') === '1';
+              const hasTooManyCols = liveDockW < 1560 && event.api.groups.length > 3;
+              if (!migratedV66 || hasTooManyCols) {
+                window.localStorage.setItem('gui.chat.dockview_v66_2col', '1');
+                const openOptIns = event.api.panels
+                  .map((p) => p.id as ChatDockPanelId)
+                  .filter((id) => id !== 'transcript' && id !== 'executionRail' && id !== 'todos');
+                if (openOptIns.length > 1 || hasTooManyCols) {
+                  const keepPreset: ChatDockPanelId[] = openOptIns.includes('urbs')
+                    ? ['urbs', 'executionRail']
+                    : ['executionRail'];
+                  applyWorkspacePreset(keepPreset);
+                }
+              }
+            }
+          }}
+        />
+        </div>
+      </div>
+
+      {secretaryToast && (
+        <div className="absolute bottom-4 left-1/2 z-60 w-[min(480px,90%)] -translate-x-1/2">
+          <SecretaryToast
+            intent={secretaryToast.intent}
+            itemId={secretaryToast.item_id}
+            onDismiss={() => setSecretaryToast(null)}
+            onConfirm={() => confirmSecretaryTask(secretaryToast)}
+          />
+        </div>
+      )}
+
+      {routingOpen && (
+        <div className="fixed inset-0 z-60" role="dialog" aria-modal="true" aria-label="Routing">
+          <div className="absolute inset-0 bg-black/60" onClick={() => setRoutingOpen(false)} />
+          <div className="absolute right-0 top-0 h-full w-[760px] max-w-full overflow-y-auto border-l border-border-subtle bg-bg-base shadow-2xl">
+            <div className="flex items-center justify-between gap-2 px-5 pt-4">
+              <div className="flex items-center gap-3">
+                <h2 className="font-display text-[13px] uppercase tracking-[0.13em] text-text-secondary">Routing</h2>
+                <div className="inline-flex rounded-md border border-border-subtle bg-overlay-subtle p-0.5" role="tablist" aria-label="Routing view mode">
+                  <button
+                    type="button"
+                    role="tab"
+                    data-testid="chat-routing-tab-matrix"
+                    aria-selected={routingDrawerTab === 'matrix'}
+                    onClick={() => setRoutingDrawerTab('matrix')}
+                    className={`whitespace-nowrap rounded px-2.5 py-0.5 font-mono text-[11px] transition ${
+                      routingDrawerTab === 'matrix'
+                        ? 'bg-brass/20 text-brass'
+                        : 'text-text-muted hover:text-text-primary'
+                    }`}
+                  >
+                    Priorities
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    data-testid="chat-routing-tab-explainer"
+                    aria-selected={routingDrawerTab === 'models'}
+                    onClick={() => setRoutingDrawerTab('models')}
+                    className={`whitespace-nowrap rounded px-2.5 py-0.5 font-mono text-[11px] transition ${
+                      routingDrawerTab === 'models'
+                        ? 'bg-brass/20 text-brass'
+                        : 'text-text-muted hover:text-text-primary'
+                    }`}
+                  >
+                    Model Comparison
+                  </button>
+                </div>
+              </div>
+              <button
+                type="button"
+                aria-label="Close routing panel"
+                onClick={() => setRoutingOpen(false)}
+                className="rounded-md border border-border-subtle px-2 py-1 font-mono text-xs text-text-muted hover:bg-overlay-hover hover:text-text-primary"
+              >
+                ✕
+              </button>
+            </div>
+            {routingDrawerTab === 'matrix' ? (
+              <Matrix pushToast={pushToast} gamifyEnabled={gamifyEnabled} />
+            ) : (
+              <ModelsView pushToast={pushToast} gamifyEnabled={gamifyEnabled} />
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

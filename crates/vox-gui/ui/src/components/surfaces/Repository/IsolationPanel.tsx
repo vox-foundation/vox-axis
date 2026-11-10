@@ -1,0 +1,153 @@
+import React, { useState } from 'react';
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+} from '../../ui/Dialog';
+import { Button } from '../../ui/Button';
+import {
+  ISOLATION_STRATEGIES,
+  conflictRows,
+  defaultStrategy,
+  perAgentRows,
+  strategyLabel,
+  type IsolationStatus,
+  type IsolationStrategy,
+} from './isolationHelpers';
+
+export interface IsolationPanelProps {
+  /** Raw `isolation_status_json` payload, or null while it is unavailable. */
+  status: IsolationStatus | null;
+  /** Set the default isolation strategy (POST /api/v2/vcs/isolation/strategy). */
+  onSetDefault?: (strategy: IsolationStrategy) => void;
+  /** True while a status fetch or write is in flight. */
+  busy?: boolean;
+  /**
+   * Optional note rendered as graceful degradation when `status` is null — e.g.
+   * the orchestrator daemon is unreachable so `get_vcs_isolation` returned nothing.
+   * (The transport IS wired: RepositoryView fetches via the `get_vcs_isolation`
+   * Tauri command over the shared orchestrator daemon.)
+   */
+  unavailableNote?: string;
+}
+
+/**
+ * Multi-agent VCS isolation panel (spec §5.4): shows the default strategy with a
+ * selector, the per-agent overrides, and live conflict rows. Presentational — the
+ * parent owns transport so this stays unit-testable and transport-agnostic.
+ */
+export function IsolationPanel({ status, onSetDefault, busy, unavailableNote }: IsolationPanelProps) {
+  const current = defaultStrategy(status);
+  const agents = perAgentRows(status);
+  const conflicts = conflictRows(status);
+
+  // Changing the default isolation strategy rewrites how every agent's work is
+  // branched/merged — a destructive config change, so it is confirm-gated.
+  const [pending, setPending] = useState<IsolationStrategy | null>(null);
+
+  return (
+    <section className="space-y-3">
+      <h3 className="font-display text-sm text-text-primary tracking-wider uppercase">
+        Multi-Agent Isolation
+      </h3>
+
+      {status === null && (
+        <p className="text-xs text-amber-300/80">
+          {unavailableNote ?? 'Live isolation status unavailable.'}
+        </p>
+      )}
+
+      <div className="flex items-center gap-2">
+        <label className="text-xs text-text-muted" htmlFor="isolation-default">
+          Default strategy
+        </label>
+        <select
+          id="isolation-default"
+          className="rounded-lg border border-border-subtle bg-overlay-subtle px-2 py-1 text-sm text-text-secondary"
+          value={current}
+          disabled={busy || !onSetDefault}
+          onChange={(e) => {
+            const next = e.target.value as IsolationStrategy;
+            if (next !== current) setPending(next);
+          }}
+        >
+          {ISOLATION_STRATEGIES.map((s) => (
+            <option key={s} value={s}>
+              {strategyLabel(s)}
+            </option>
+          ))}
+        </select>
+        <span className="text-xs text-text-muted">active: {strategyLabel(current)}</span>
+      </div>
+
+      <div>
+        <h4 className="mb-1 text-xs text-text-muted">Per-agent overrides</h4>
+        {agents.length === 0 ? (
+          <p className="text-xs text-text-muted">No per-agent overrides.</p>
+        ) : (
+          <table className="w-full text-left text-xs text-text-secondary">
+            <thead className="text-text-muted">
+              <tr>
+                <th className="py-1 pr-4">Agent</th>
+                <th className="py-1">Strategy</th>
+              </tr>
+            </thead>
+            <tbody>
+              {agents.map((row) => (
+                <tr key={row.agentId} className="border-t border-border-subtle">
+                  <td className="py-1 pr-4 font-mono">A-{row.agentId}</td>
+                  <td className="py-1">{strategyLabel(row.strategy)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div>
+        <h4 className="mb-1 text-xs text-text-muted">Active conflicts</h4>
+        {conflicts.length === 0 ? (
+          <p className="text-xs text-emerald-300/80">No active conflicts</p>
+        ) : (
+          <ul className="space-y-1 text-xs text-rose-300">
+            {conflicts.map((c) => (
+              <li key={c.id} className="font-mono break-all">
+                {c.path} <span className="text-text-muted">— agents {c.sides.join(', ')}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <Dialog open={pending !== null} onOpenChange={(o) => { if (!o) setPending(null); }}>
+        <DialogContent aria-label="Confirm isolation strategy change">
+          <DialogTitle>Change default isolation strategy?</DialogTitle>
+          <DialogDescription>
+            This changes how every agent&apos;s work is branched and merged
+            {pending ? ` to “${strategyLabel(pending)}”` : ''}. In-flight agents may be affected.
+          </DialogDescription>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button
+              type="button"
+              onClick={() => setPending(null)}
+              className="rounded-lg border border-border-subtle px-3 py-1.5 text-sm text-text-secondary hover:bg-overlay-subtle"
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                if (pending) onSetDefault?.(pending);
+                setPending(null);
+              }}
+              className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-sm text-rose-200 hover:bg-rose-500/20"
+            >
+              Change strategy
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </section>
+  );
+}

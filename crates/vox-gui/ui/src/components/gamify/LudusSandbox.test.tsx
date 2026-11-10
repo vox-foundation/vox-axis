@@ -1,0 +1,66 @@
+// crates/vox-gui/ui/src/components/gamify/LudusSandbox.test.tsx  (full replacement)
+// The pragma above is REQUIRED as line 1: vitest.config.ts sets no global
+// environment, so render()/screen crash under the default node env without it.
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+
+const workspaceTownScan = vi.fn();
+const openLocator = vi.fn();
+vi.mock('../../transport', () => ({
+  listenAgentEvents: vi.fn().mockRejectedValue(new Error('not in tauri')),
+  // useLlmSpend (used for the HUD treasury) reads voxTransport from the same
+  // module — the mock must provide it or the hook crashes on mount.
+  voxTransport: {
+    getLlmSpend: vi.fn().mockRejectedValue(new Error('unavailable')),
+    workspaceTownScan: (...a: unknown[]) => workspaceTownScan(...a),
+    openLocator: (...a: unknown[]) => openLocator(...a),
+    harnessCiFleetStatus: vi.fn().mockRejectedValue(new Error('unavailable')),
+    vcsTownStatus: vi.fn().mockRejectedValue(new Error('unavailable')),
+    hopperList: vi.fn().mockRejectedValue(new Error('unavailable')),
+  },
+}));
+
+import { LudusSandbox } from './LudusSandbox';
+
+const SCAN = {
+  crates: [{ name: 'a', root: 'crates/a', files: [{ path: 'crates/a/x.rs', lines: 10 }] }],
+  root: '/ws', scanned_at_ms: 1, truncated: false,
+};
+
+beforeEach(() => {
+  workspaceTownScan.mockReset();
+  openLocator.mockReset();
+  workspaceTownScan.mockResolvedValue(SCAN);
+});
+
+describe('LudusSandbox (Vox Urbs shell)', () => {
+  it('renders the town canvas and loads the workspace scan', async () => {
+    render(<LudusSandbox />);
+    await waitFor(() => expect(workspaceTownScan).toHaveBeenCalled());
+    expect(screen.getByTestId('urbs-canvas')).toBeTruthy();
+  });
+
+  it('shows SIM PAVSED when the agent event stream is unavailable', async () => {
+    render(<LudusSandbox />);
+    await waitFor(() => expect(screen.getByText(/SIM PAVSED/i)).toBeTruthy());
+  });
+
+  it('shows a scan-failed state (not a fake town) when the scan tap fails', async () => {
+    workspaceTownScan.mockRejectedValue(new Error('nope'));
+    render(<LudusSandbox />);
+    await waitFor(() => expect(screen.getByText(/scan unavailable/i)).toBeTruthy());
+  });
+
+  it('renders the HUD with real-null treasury (em-dash) when spend tap fails', async () => {
+    render(<LudusSandbox />);
+    await waitFor(() => expect(screen.getByTestId('hud-value').textContent).toBe('—'));
+  });
+
+  it('shows a loading/no-data affordance instead of a blank canvas while layout is unset (F-06)', async () => {
+    // Make the scan hang (pending forever): the component has neither layout
+    // nor scanFailed - the previously-blank state.
+    workspaceTownScan.mockImplementation(() => new Promise(() => {}));
+    render(<LudusSandbox />);
+    expect(await screen.findByText(/simulation loading|no workspace data/i)).toBeInTheDocument();
+  });
+});

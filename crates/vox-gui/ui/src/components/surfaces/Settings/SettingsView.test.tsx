@@ -1,0 +1,298 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import React from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+const mockSetGuiPreference = vi.fn().mockResolvedValue(undefined);
+
+const SECRET_ROW = {
+  id: 'db-token',
+  canonicalEnv: 'VOX_DB_TOKEN',
+  scopeDescription: 'Turso database token',
+  taxonomySlug: 'database',
+  authRegistry: null,
+  required: true,
+  isPresent: false,
+  status: 'missing',
+  redacted: '',
+  source: null,
+  remediation: 'Set via vault',
+};
+
+const invokeMock = vi.fn((cmd: string, args?: { key?: string }) => {
+  if (cmd === 'get_orchestrator_config') return Promise.resolve({});
+  if (cmd === 'list_secret_status') return Promise.resolve([SECRET_ROW]);
+  if (cmd === 'secrets_backend_status') {
+    return Promise.resolve({
+      backendMode: 'vault',
+      profile: 'dev',
+      strict: false,
+      available: true,
+      detail: null,
+    });
+  }
+  if (cmd === 'set_secret') return Promise.resolve(true);
+  if (cmd === 'signing_key_status') {
+    return Promise.resolve({
+      nodeId: 'node-abc',
+      algorithm: 'ed25519',
+      fingerprint: 'fp-deadbeef',
+      pubkeyHex: '00',
+      present: true,
+    });
+  }
+  if (cmd === 'rotate_signing_key') {
+    return Promise.resolve({
+      nodeId: 'node-abc',
+      algorithm: 'ed25519',
+      fingerprint: 'fp-cafebabe',
+      pubkeyHex: '01',
+      present: true,
+    });
+  }
+  return Promise.resolve(null);
+});
+
+// Mock Tauri invoke — SettingsView fires multiple invoke() calls on mount.
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args as { key?: string }),
+}));
+
+const recordGamifyMock = vi.fn().mockResolvedValue(null);
+vi.mock('../../../lib/gamifyGuiEvents', () => ({
+  recordGamifyGuiEvent: (...args: unknown[]) => recordGamifyMock(...args),
+}));
+
+// Mock Tauri event listen — transport.ts calls listen() on import.
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
+// Mock voxTransport — SettingsView calls getRoutingSummaryLive on mount.
+vi.mock('../../../transport', () => ({
+  voxTransport: {
+    getRoutingSummaryLive: vi.fn().mockResolvedValue({ routing_priority: null }),
+    setRoutingPriority: vi.fn().mockResolvedValue(undefined),
+    getGuiPreference: vi.fn().mockResolvedValue(null),
+    get setGuiPreference() {
+      return mockSetGuiPreference;
+    },
+  },
+}));
+
+// Mock PriorityChainEditor — it makes its own invoke calls.
+vi.mock('./PriorityChainEditor', () => ({
+  PriorityChainEditor: () => <div data-testid="priority-chain-editor" />,
+}));
+
+import { SettingsView } from './SettingsView';
+import { getBindings, resetKeybindStoreForTests } from '../../../lib/keybindStore';
+import { LanguageProvider } from '../../../hooks/useLanguage';
+
+function wrapper({ children }: { children: React.ReactNode }) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return (
+    <QueryClientProvider client={qc}>
+      <LanguageProvider>{children}</LanguageProvider>
+    </QueryClientProvider>
+  );
+}
+
+describe('SettingsView', () => {
+  beforeEach(() => {
+    invokeMock.mockClear();
+    recordGamifyMock.mockClear();
+    resetKeybindStoreForTests();
+  });
+
+  it('renders without crashing', () => {
+    expect(() =>
+      render(<SettingsView pushToast={vi.fn()} />, { wrapper })
+    ).not.toThrow();
+  });
+
+  it('all buttons have type=button', () => {
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    const buttons = screen.getAllByRole('button');
+    buttons.forEach(btn => {
+      expect(btn.getAttribute('type')).toBe('button');
+    });
+  });
+
+  it('names each range control by its row label (axe label, critical)', () => {
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    for (const name of [
+      'Max concurrent agents',
+      'Global budget cap (USD)',
+      'Auto-doubt threshold',
+      'Durable checkpoint cadence',
+    ]) {
+      expect(screen.getByRole('slider', { name })).toBeDefined();
+    }
+  });
+
+  it('renders when the backend has no orchestrator config (get_orchestrator_config -> null)', async () => {
+    const defaultImpl = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === 'get_orchestrator_config' ? null : cmd === 'list_secret_status' ? [] : null),
+    );
+    try {
+      render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(screen.getByRole('slider', { name: 'Max concurrent agents' })).toBeDefined();
+    } finally {
+      invokeMock.mockImplementation(defaultImpl);
+    }
+  });
+
+  it('search input is accessible via aria-label', () => {
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    const searchInput = screen.getByLabelText('Search settings');
+    expect(searchInput).toBeDefined();
+  });
+
+  it('renders section nav items for all 12 settings sections', () => {
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    // The nav renders one button per section label (12 sections defined in SECTIONS).
+    const navButtons = screen.getAllByRole('button');
+    // At least the 12 nav section buttons should be present.
+    expect(navButtons.length).toBeGreaterThanOrEqual(12);
+    // Spot-check a few known section labels (use getAllByText since headings also appear).
+    expect(screen.getAllByText('Orchestrator').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Theme').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Keybinds').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('announces preference save via aria-live when theme changes', async () => {
+    const user = userEvent.setup();
+    mockSetGuiPreference.mockClear();
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /theme/i }));
+    const voidTheme = await screen.findByRole('button', { name: /void/i });
+    await user.click(voidTheme);
+    await waitFor(() => expect(mockSetGuiPreference).toHaveBeenCalledWith('gui.theme', 'void'));
+    expect(await screen.findByRole('status')).toHaveTextContent(/saved/i);
+  });
+
+  it('fires secret_rotated when set_secret succeeds', async () => {
+    const user = userEvent.setup();
+    render(<SettingsView pushToast={vi.fn()} gamifyEnabled />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /keys & secrets/i }));
+    const input = await screen.findByPlaceholderText('Paste new value…');
+    await user.type(input, 'super-secret-value');
+    fireEvent.click(screen.getByRole('button', { name: 'save' }));
+    await waitFor(() => {
+      expect(recordGamifyMock).toHaveBeenCalledWith(
+        'secret_rotated',
+        { key: 'VOX_DB_TOKEN' },
+        { enabled: true },
+      );
+    });
+  });
+
+  it('fires signing_key_rotated when rotate succeeds on an existing key', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('prompt', vi.fn(() => 'master-password'));
+    render(<SettingsView pushToast={vi.fn()} gamifyEnabled />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /signing keys/i }));
+    await screen.findByText('fp-deadbeef');
+    fireEvent.click(screen.getByRole('button', { name: 'rotate' }));
+    await waitFor(() => {
+      expect(recordGamifyMock).toHaveBeenCalledWith(
+        'signing_key_rotated',
+        expect.objectContaining({ node_id: 'node-abc', fingerprint: 'fp-cafebabe' }),
+        { enabled: true },
+      );
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it('keybinds section shows a row for each ACTION_REGISTRY entry', async () => {
+    const user = userEvent.setup();
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /keybinds/i }));
+    // Each action should have a button with its default chord
+    const { ACTION_REGISTRY, DEFAULT_BINDINGS } = await import('../../../lib/keybinds');
+    for (const a of ACTION_REGISTRY) {
+      const btn = await screen.findByTestId(`keybind-btn-${a.id}`);
+      expect(btn.textContent).toBe(DEFAULT_BINDINGS[a.id]);
+    }
+  });
+
+  it('keybinds section: clicking a row enters capture mode and saves on keydown', async () => {
+    const user = userEvent.setup();
+    mockSetGuiPreference.mockClear();
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /keybinds/i }));
+    const captureBtn = await screen.findByTestId('keybind-btn-open-palette');
+    await user.click(captureBtn);
+    expect(captureBtn.textContent).toBe('press keys…');
+    // Fire a new key combo
+    fireEvent.keyDown(window, { key: 'p', ctrlKey: true, cancelable: true }, { capture: true });
+    await waitFor(() => expect(captureBtn.textContent).toBe('Mod+P'));
+    await waitFor(() => expect(mockSetGuiPreference).toHaveBeenCalledWith(
+      'gui.keybinds',
+      expect.stringContaining('"open-palette":"Mod+P"'),
+    ));
+  });
+
+  it('keybinds: a rebind lands in the shared store, and reset restores defaults (D-17)', async () => {
+    const user = userEvent.setup();
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /keybinds/i }));
+    const btn = await screen.findByTestId('keybind-btn-open-palette');
+    await user.click(btn);
+    fireEvent.keyDown(window, { key: 'p', ctrlKey: true, cancelable: true }, { capture: true });
+    await waitFor(() => expect(getBindings()['open-palette']).toBe('Mod+P'));
+    await user.click(screen.getByRole('button', { name: /reset to defaults/i }));
+    await waitFor(() => expect(getBindings()['open-palette']).toBe('Mod+K'));
+    expect(btn.textContent).toBe('Mod+K');
+  });
+
+  it('keybinds: a bare modifier keydown does not end capture; the chord completes on the real key', async () => {
+    const user = userEvent.setup();
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /keybinds/i }));
+    const btn = await screen.findByTestId('keybind-btn-toggle-sidebar');
+    await user.click(btn);
+    fireEvent.keyDown(window, { key: 'Control', ctrlKey: true, cancelable: true });
+    fireEvent.keyDown(window, { key: 'Shift', ctrlKey: true, shiftKey: true, cancelable: true });
+    expect(btn.textContent).toBe('press keys…');
+    fireEvent.keyDown(window, { key: 'y', ctrlKey: true, shiftKey: true, cancelable: true });
+    await waitFor(() => expect(btn.textContent).toBe('Mod+Shift+Y'));
+  });
+
+  it('keybinds: a change made elsewhere in the store shows in Settings (D-17)', async () => {
+    const user = userEvent.setup();
+    const { setBindings } = await import('../../../lib/keybindStore');
+    const { DEFAULT_BINDINGS } = await import('../../../lib/keybinds');
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await user.click(screen.getByRole('button', { name: /keybinds/i }));
+    const btn = await screen.findByTestId('keybind-btn-toggle-sidebar');
+    React.act(() => setBindings({ ...DEFAULT_BINDINGS, 'toggle-sidebar': 'Mod+Shift+Y' }));
+    expect(btn.textContent).toBe('Mod+Shift+Y');
+  });
+
+  it('toggles display language and persists vox.lang', () => {
+    window.localStorage.clear();
+    render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    fireEvent.click(screen.getByRole('button', { name: /^Display$/i }));
+    expect(screen.getByText('Latin labels')).toBeInTheDocument();
+    // Toggle is aria-pressed=false initially; it's the only toggle in the display section
+    const toggle = screen.getByRole('button', { name: /^Toggle off$/i });
+    fireEvent.click(toggle);
+    expect(window.localStorage.getItem('vox.lang')).toBe('la');
+  });
+
+  it('mounts and unmounts without unhandled rejections when the config-changed listener fails', async () => {
+    const { listen } = await import('@tauri-apps/api/event');
+    (listen as unknown as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('event bridge unavailable'),
+    );
+    const { unmount } = render(<SettingsView pushToast={vi.fn()} />, { wrapper });
+    await screen.findByLabelText('Search settings');
+    unmount();
+    await new Promise((r) => setTimeout(r, 0));
+  });
+});

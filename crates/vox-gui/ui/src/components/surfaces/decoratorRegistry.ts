@@ -1,0 +1,56 @@
+import React from 'react';
+import { CommandCardsView, SurfaceCard } from './CommandCardsView';
+import { ScientiaSurface } from './Scientia/ScientiaSurface';
+import { ResearchView } from './Research/ResearchView';
+import { PublicationsView } from './Publications/PublicationsView';
+import { SubAgentsView } from './SubAgents/SubAgentsView';
+import { MensTrainingView } from './Models/MensTrainingView';
+import type { Toast } from '../../types/tauri';
+
+/**
+ * Props every surface decorator receives. Decorators are hand-built views that
+ * replace the default (generated/built-in) view for a surface key. They MUST
+ * route command execution through the shared `execute_command` Tauri path so
+ * every surface stays on one run seam.
+ */
+export interface SurfaceDecoratorProps {
+  pushToast: (item: Toast) => void;
+  /** When false, gamify GUI event hooks are no-ops (Settings SSOT polled in App). */
+  gamifyEnabled?: boolean;
+}
+
+/** Build a read-only command-cards decorator for a Tier-3 CLI surface. */
+function commandSurface(
+  title: string,
+  subtitle: string,
+  cards: SurfaceCard[]
+): React.ComponentType<SurfaceDecoratorProps> {
+  return function Surface({ pushToast }: SurfaceDecoratorProps) {
+    return React.createElement(CommandCardsView, { title, subtitle, cards, pushToast });
+  };
+}
+
+/**
+ * Surface key → decorator. `App.tsx::renderView` consults this before its
+ * built-in switch, so promoting a surface to a decorated view is a one-line
+ * registration here and removing the entry reverts to the default with no other
+ * change. Each command below is an arg-free, read-only CLI command.
+ */
+export const surfaceDecorators: Record<string, React.ComponentType<SurfaceDecoratorProps>> = {
+  scientia: ScientiaSurface,
+  // Bespoke, not `commandSurface`: the GPU Probe card needs the model the
+  // user actually selected (`get_active_model`) to check a real fit, not a
+  // static arg-free command — see `Models/MensTrainingView.tsx`.
+  mens: MensTrainingView,
+  populi: commandSurface('Vox Populi', 'Distributed mesh network', [
+    { key: 'status', title: 'Mesh Status', description: 'Network health + overlay diagnostics', path: ['populi', 'status'] },
+    { key: 'registry', title: 'Local Snapshot', description: 'On-disk registry + environment', path: ['populi', 'registry-snapshot'] },
+  ]),
+  research: ResearchView,
+  publications: PublicationsView,
+  oratio: commandSurface('Vox Oratio', 'Speech-to-code runtime', [
+    { key: 'doctor', title: 'Runtime Health', description: 'Oratio runtime + configuration diagnostics', path: ['oratio', 'doctor'] },
+    { key: 'status', title: 'Backend Status', description: 'Available backends + passthrough modes', path: ['oratio', 'status'] },
+  ]),
+  'sub-agents': SubAgentsView,
+};

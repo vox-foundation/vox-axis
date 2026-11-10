@@ -1,0 +1,713 @@
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import React from 'react';
+
+// resolve_default_task_policy defaults to the same values as the local
+// hardcoded defaultControl() fallback, so tests that don't care about this
+// fetch keep seeing the composer settle on efficiency/moderate as before.
+const { mockInvoke, defaultMockInvokeImpl, mockListModels } = vi.hoisted(() => {
+  const defaultMockInvokeImpl = (cmd: string) => {
+    if (cmd === 'resolve_default_task_policy') {
+      return Promise.resolve({ clutch: 'efficiency', risk: 'moderate' });
+    }
+    return Promise.resolve([]);
+  };
+  return {
+    mockInvoke: vi.fn(defaultMockInvokeImpl),
+    defaultMockInvokeImpl,
+    mockListModels: vi.fn(() => Promise.resolve([])),
+  };
+});
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mockInvoke }));
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
+vi.mock('../../../transport', () => ({
+  voxTransport: { listModels: (...a: unknown[]) => mockListModels(...a) },
+}));
+
+import { Loquela } from './Loquela';
+import { MODEL_LIST_LIMIT } from '../../../config/constants';
+
+function renderLoquela(over: Partial<React.ComponentProps<typeof Loquela>> = {}) {
+  return render(
+    <Loquela
+      chips={[]}
+      setChips={() => {}}
+      onSubmit={() => {}}
+      activeSkill={null}
+      setActiveSkill={() => {}}
+      skills={[]}
+      {...over}
+    />,
+  );
+}
+
+describe('Loquela', () => {
+  afterEach(() => {
+    // Reset both call history and any per-test mockImplementation override
+    // (e.g. from the resolve_default_task_policy test below) so a failing
+    // assertion mid-test can't leak a stale implementation into later tests.
+    mockInvoke.mockReset();
+    mockInvoke.mockImplementation(defaultMockInvokeImpl);
+    mockListModels.mockReset();
+    mockListModels.mockImplementation(() => Promise.resolve([]));
+  });
+
+  it('labels the composer textarea (no placeholder-as-label)', () => {
+    renderLoquela();
+    expect(screen.getByLabelText('Task composer')).toBeDefined();
+  });
+
+  it('every button carries an explicit type="button"', () => {
+    renderLoquela();
+    for (const b of screen.getAllByRole('button')) {
+      expect(b.getAttribute('type')).toBe('button');
+    }
+  });
+
+  it('icon-only attach controls expose accessible names', () => {
+    renderLoquela();
+    expect(screen.getByRole('button', { name: /attach local file/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /attach a url/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /voice input/i })).toBeDefined();
+  });
+
+  it('tier and skill menus expose aria-expanded', () => {
+    renderLoquela();
+    expect(
+      screen.getByRole('button', { name: /choose model tier/i }).getAttribute('aria-expanded'),
+    ).toBe('false');
+    expect(
+      screen.getByRole('button', { name: /choose skill/i }).getAttribute('aria-expanded'),
+    ).toBe('false');
+  });
+
+  it('shows a Stop button while a task is in progress', () => {
+    renderLoquela({ taskInProgress: true, currentTaskId: 7 });
+    expect(screen.getByRole('button', { name: /stop/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^run/i })).toBeNull();
+  });
+
+  it('Enter interrupts the running task instead of submitting', () => {
+    const onSubmit = vi.fn();
+    const onInterrupt = vi.fn();
+    renderLoquela({ taskInProgress: true, currentTaskId: 42, onSubmit, onInterrupt });
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'next idea' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onInterrupt).toHaveBeenCalledWith(42);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('Stop button click interrupts with the current task id', () => {
+    const onInterrupt = vi.fn();
+    renderLoquela({ taskInProgress: true, currentTaskId: 99, onInterrupt });
+    fireEvent.click(screen.getByRole('button', { name: /stop/i }));
+    expect(onInterrupt).toHaveBeenCalledWith(99);
+  });
+
+  it('Enter submits normally when no task is running', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'do a thing' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onSubmit).toHaveBeenCalled();
+  });
+
+  it('composer root has no p-4 inset (aligns flush with the chat transcript)', () => {
+    renderLoquela();
+    const root = screen.getByTestId('loquela-composer');
+    expect(root.className).not.toContain('p-4');
+  });
+
+  it('Run button height matches the textarea min-height (h-9 vs min-h-[36px])', () => {
+    renderLoquela();
+    expect(screen.getByRole('button', { name: /^run/i }).className).toContain('h-9');
+  });
+
+  it('secondary controls live in the toolbar row, not the input row', () => {
+    renderLoquela();
+    const ta = screen.getByLabelText('Task composer');
+    const inputRow = ta.parentElement?.parentElement as HTMLElement;
+    const attach = screen.getByRole('button', { name: /attach local file/i });
+    expect(inputRow.contains(attach)).toBe(false);
+    expect(inputRow.contains(screen.getByRole('button', { name: /voice input/i }))).toBe(false);
+    expect(inputRow.contains(screen.getByRole('button', { name: /^run/i }))).toBe(true);
+  });
+
+  it('intent panel is collapsed by default and toggles open', () => {
+    renderLoquela();
+    expect(screen.queryByLabelText('Goal')).toBeNull();
+    const toggle = screen.getByRole('button', { name: /structured intent/i });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(toggle);
+    expect(screen.getByLabelText('Goal')).toBeDefined();
+  });
+
+  it('serializes intent fields into the submitted description and priority', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: /set send mode: background task/i }));
+    fireEvent.click(screen.getByRole('button', { name: /structured intent/i }));
+    fireEvent.change(screen.getByLabelText('Goal'), { target: { value: 'ship dark mode' } });
+    fireEvent.change(screen.getByLabelText('Acceptance criteria'), { target: { value: 'toggle persists' } });
+    fireEvent.change(screen.getByLabelText('Effort'), { target: { value: 'urgent' } });
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'add a theme switch' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    const payload = onSubmit.mock.calls[0][0];
+    expect(payload.description).toContain('add a theme switch');
+    expect(payload.description).toContain('## Goal\nship dark mode');
+    expect(payload.description).toContain('## Acceptance criteria\ntoggle persists');
+    expect(payload.priority).toBe('urgent');
+  });
+
+  it('goal alone is submittable without free text', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    fireEvent.click(screen.getByRole('button', { name: /structured intent/i }));
+    fireEvent.change(screen.getByLabelText('Goal'), { target: { value: 'ship dark mode' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run/i }));
+    expect(onSubmit.mock.calls[0][0].description).toBe('ship dark mode');
+  });
+
+  it('collapses the intent panel after a structured submit', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    fireEvent.click(screen.getByRole('button', { name: /structured intent/i }));
+    fireEvent.change(screen.getByLabelText('Goal'), { target: { value: 'ship dark mode' } });
+    fireEvent.click(screen.getByRole('button', { name: /^run/i }));
+    expect(screen.queryByLabelText('Goal')).toBeNull();
+    expect(screen.getByRole('button', { name: /structured intent/i }).getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('renders trailingSlot at the far right of the toolbar row, after mic/attach/link controls', () => {
+    renderLoquela({ trailingSlot: <button type="button">Model: auto</button> });
+    const slotButton = screen.getByRole('button', { name: /model: auto/i });
+    const micButton = screen.getByRole('button', { name: /voice input/i });
+    // Both live in the same toolbar row; the slot must come after the
+    // left-side attach/mic controls in DOM order (source order + ml-auto is
+    // what pushes it visually to the right).
+    expect(
+      micButton.compareDocumentPosition(slotButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('omits the trailing slot container entirely when trailingSlot is not provided', () => {
+    renderLoquela();
+    expect(screen.queryByRole('button', { name: /model:/i })).toBeNull();
+  });
+
+  it('renders a Resume button when the current agent is paused, calling onResume with the agent while preserving the primary Run CTA', () => {
+    const onResume = vi.fn();
+    renderLoquela({
+      agentPaused: true,
+      currentAgent: { id: 'a1' } as any,
+      onResume,
+    });
+    const resumeBtn = screen.getByRole('button', { name: /resume/i });
+    expect(screen.getByTestId('loquela-agent-paused-banner')).toBe(resumeBtn);
+    expect(screen.getByRole('button', { name: /^run/i })).toBeInTheDocument();
+    fireEvent.click(resumeBtn);
+    expect(onResume).toHaveBeenCalledWith({ id: 'a1' });
+  });
+
+  it('the Run button carries its own keyboard-shortcut hint, with no other disconnected shortcut hint elsewhere', () => {
+    renderLoquela();
+    const runButton = screen.getByRole('button', { name: /^run/i });
+    expect(runButton).toHaveTextContent('↵');
+    // Reproduces a live bug: a bare "⌘↵" kbd hint used to render alone at
+    // the end of the toolbar row, disconnected from any button — it must
+    // not exist anywhere outside the Run button now.
+    const allKbds = document.querySelectorAll('kbd');
+    const kbdsOutsideRunButton = Array.from(allKbds).filter((k) => !runButton.contains(k));
+    expect(kbdsOutsideRunButton.map((k) => k.textContent)).not.toContain('⌘↵');
+  });
+
+  it('seeds the DriveConsole default from resolve_default_task_policy instead of a hardcoded guess', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'resolve_default_task_policy') {
+        return Promise.resolve({ clutch: 'free', risk: 'high' });
+      }
+      return Promise.resolve([]);
+    });
+    renderLoquela();
+    await waitFor(() => {
+      const freeButton = screen.getByRole('radio', { name: /free/i });
+      expect(freeButton).toHaveAttribute('aria-checked', 'true');
+    });
+    // No manual restore needed here — the top-level afterEach resets
+    // mockInvoke back to defaultMockInvokeImpl even if this test fails
+    // before reaching this point.
+  });
+
+  it('does not clobber a user-made clutch pick if resolve_default_task_policy resolves afterward', async () => {
+    let resolveDefault: (value: { clutch: string; risk: string }) => void = () => {};
+    const deferred = new Promise<{ clutch: string; risk: string }>((resolve) => {
+      resolveDefault = resolve;
+    });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'resolve_default_task_policy') {
+        return deferred;
+      }
+      return Promise.resolve([]);
+    });
+    renderLoquela();
+
+    // User picks "Genius" before the backend's default has resolved.
+    const geniusButton = screen.getByRole('radio', { name: /genius/i });
+    fireEvent.click(geniusButton);
+    expect(geniusButton).toHaveAttribute('aria-checked', 'true');
+
+    // The slow backend fetch now resolves with a DIFFERENT value — it must
+    // not silently revert the user's already-made choice.
+    resolveDefault({ clutch: 'free', risk: 'high' });
+    await waitFor(() => {
+      const freeButton = screen.getByRole('radio', { name: /^free$/i });
+      expect(freeButton).toHaveAttribute('aria-checked', 'false');
+    });
+    expect(geniusButton).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('keeps the hardcoded default when resolve_default_task_policy resolves to null (e.g. an unmocked IPC call)', async () => {
+    // Regression test: a naive `.then((resolved) => setControl(resolved))`
+    // would set `control` to `null`, crashing DriveConsole's render (it reads
+    // `control.risk`) — this reproduces exactly that shape of response, as
+    // seen from a harness whose default mock resolves unmocked commands to
+    // `null` rather than rejecting.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'resolve_default_task_policy') {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve([]);
+    });
+    renderLoquela();
+    await waitFor(() => {
+      const efficButton = screen.getByRole('radio', { name: /effic/i });
+      expect(efficButton).toHaveAttribute('aria-checked', 'true');
+    });
+  });
+
+  it('lists keyed catalog models (including OpenRouter) instead of Model 1–4 placeholders', async () => {
+    mockListModels.mockResolvedValue([
+      { id: 'aion-labs/aion-1.0', provider: 'aion-labs', provider_type: 'OpenRouter' },
+      { id: 'openrouter/anthropic/claude-sonnet', provider: 'anthropic', provider_type: 'OpenRouter' },
+      { id: 'mens/e2e-smoke-metal', provider: 'populi_local', provider_type: 'VoxLocal' },
+    ]);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'resolve_default_task_policy') {
+        return Promise.resolve({ clutch: 'efficiency', risk: 'moderate' });
+      }
+      if (cmd === 'inference_provider_status') {
+        return Promise.resolve([
+          { provider: 'OpenRouter', key_present: true, is_local: false, local_reachable: null },
+          { provider: 'VoxLocal', key_present: true, is_local: true, local_reachable: true, local_models: ['e2e-smoke-metal'] },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    renderLoquela();
+    fireEvent.click(screen.getByRole('button', { name: /choose model tier/i }));
+    expect(await screen.findByRole('searchbox', { name: /search models/i })).toBeDefined();
+    expect(await screen.findByText('openrouter/anthropic/claude-sonnet')).toBeDefined();
+    expect(screen.getByText('mens/e2e-smoke-metal')).toBeDefined();
+    expect(screen.queryByText('Model 1')).toBeNull();
+    fireEvent.change(screen.getByRole('searchbox', { name: /search models/i }), {
+      target: { value: 'mens' },
+    });
+    expect(screen.getByText('mens/e2e-smoke-metal')).toBeDefined();
+    expect(screen.queryByText('openrouter/anthropic/claude-sonnet')).toBeNull();
+  });
+
+  it('emits model_override for a concrete pick, not a fake model-N tier id', async () => {
+    mockListModels.mockResolvedValue([
+      { id: 'openrouter/anthropic/claude-sonnet', provider: 'anthropic', provider_type: 'OpenRouter' },
+    ]);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'resolve_default_task_policy') {
+        return Promise.resolve({ clutch: 'efficiency', risk: 'moderate' });
+      }
+      if (cmd === 'inference_provider_status') {
+        return Promise.resolve([
+          { provider: 'OpenRouter', key_present: true, is_local: false, local_reachable: null },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    const onSubmit = vi.fn();
+    const onModelPick = vi.fn();
+    renderLoquela({ onSubmit, onModelPick });
+    fireEvent.click(screen.getByRole('button', { name: /choose model tier/i }));
+    fireEvent.click(await screen.findByText('openrouter/anthropic/claude-sonnet'));
+    expect(onModelPick).toHaveBeenCalledWith('openrouter/anthropic/claude-sonnet');
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'use sonnet' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onSubmit.mock.calls[0][0].model_override).toBe('openrouter/anthropic/claude-sonnet');
+    expect(onSubmit.mock.calls[0][0].tier).toBe('auto');
+  });
+
+  it('does not expose a Dry-run control in either send mode', () => {
+    renderLoquela();
+    expect(screen.queryByRole('button', { name: 'Dry-run' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: /set send mode: background task/i }));
+    expect(screen.queryByRole('button', { name: 'Dry-run' })).toBeNull();
+  });
+
+  it('always submits dry_run false', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'x' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onSubmit.mock.calls[0][0].dry_run).toBe(false);
+  });
+
+  it('hides Effort on Quick chat and shows it on Background task', () => {
+    renderLoquela();
+    fireEvent.click(screen.getByRole('button', { name: /structured intent/i }));
+    expect(screen.queryByLabelText('Effort')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: /set send mode: background task/i }));
+    expect(screen.getByLabelText('Effort')).toBeInTheDocument();
+  });
+
+  it('shows an Interaction mode chip on Background task', () => {
+    renderLoquela();
+    expect(screen.queryByLabelText('Interaction mode')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: /set send mode: background task/i }));
+    expect(screen.getByLabelText('Interaction mode')).toHaveTextContent(/act/i);
+  });
+
+  it('shows Verify on the Interaction mode chip after /verify', () => {
+    renderLoquela();
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: /set send mode: background task/i }));
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: '/verify' } });
+    fireEvent.click(screen.getByRole('button', { name: /\/verify/i }));
+    expect(screen.getByLabelText('Interaction mode')).toHaveTextContent(/verify/i);
+  });
+
+  it('submits selectedModelId over a stale local tier', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit, selectedModelId: 'mens/e2e-smoke-metal', onModelPick: vi.fn() });
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'hello' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onSubmit.mock.calls[0][0].model_override).toBe('mens/e2e-smoke-metal');
+  });
+
+  it('keeps search outside the model list scroller and lists 25 catalog rows', async () => {
+    const catalog = Array.from({ length: 25 }, (_, i) => ({
+      id: i === 24 ? 'mens/e2e-smoke-metal' : `openrouter/vendor/model-${i}`,
+      provider_type: i === 24 ? 'VoxLocal' : 'OpenRouter',
+    }));
+    // Honor the requested limit so a too-small cap (the old 24) would drop
+    // the late mens row instead of the mock silently returning the full set.
+    mockListModels.mockImplementation((limit?: unknown) => {
+      const cap = typeof limit === 'number' ? limit : 0;
+      return Promise.resolve(catalog.slice(0, cap));
+    });
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'resolve_default_task_policy') {
+        return Promise.resolve({ clutch: 'efficiency', risk: 'moderate' });
+      }
+      if (cmd === 'inference_provider_status') {
+        return Promise.resolve([
+          { provider: 'OpenRouter', key_present: true, is_local: false, local_reachable: null },
+          { provider: 'VoxLocal', key_present: true, is_local: true, local_reachable: true, local_models: ['e2e-smoke-metal'] },
+        ]);
+      }
+      return Promise.resolve([]);
+    });
+    renderLoquela();
+    await waitFor(() => {
+      expect(mockListModels).toHaveBeenCalledWith(MODEL_LIST_LIMIT);
+    });
+    expect(MODEL_LIST_LIMIT).toBe(2000);
+    fireEvent.click(screen.getByRole('button', { name: /choose model tier/i }));
+    const search = await screen.findByRole('searchbox', { name: /search models/i });
+    const scroller = screen.getByTestId('model-picker-scroll');
+    expect(scroller.contains(search)).toBe(false);
+    expect(search.parentElement?.className).toMatch(/sticky/);
+    expect(search.parentElement?.className).not.toMatch(/bg-zinc-/);
+    expect(scroller.className).toMatch(/overflow-y-auto/);
+    expect(scroller.className).toMatch(/max-h-/);
+    expect(await screen.findByText('mens/e2e-smoke-metal')).toBeInTheDocument();
+  });
+
+  it('surfaces a short status when listModels returns an empty catalog', async () => {
+    mockListModels.mockResolvedValue([]);
+    renderLoquela();
+    expect(await screen.findByTestId('model-load-status')).toHaveTextContent(/no models loaded/i);
+  });
+
+  it('surfaces a short status when listModels fails', async () => {
+    mockListModels.mockRejectedValue(new Error('ipc unavailable'));
+    renderLoquela();
+    expect(await screen.findByTestId('model-load-status')).toHaveTextContent(/models unavailable/i);
+  });
+
+  it('shows full mode names and still sends the wire value "efficiency"', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    fireEvent.click(screen.getByRole('radio', { name: 'Balanced' }));
+    fireEvent.click(screen.getByRole('radio', { name: 'Efficient' }));
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'ship it' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onSubmit.mock.calls[0][0].clutch).toBe('efficiency');
+  });
+
+  it('never shows a spend cap the daemon did not report (fallback source)', () => {
+    renderLoquela({ sessionBudget: { spent: 1, cap: 50, source: 'fallback' } });
+    expect(screen.getByTestId('drive-console-spend').textContent).toBe('Spend$1.00');
+  });
+
+  it('renders riskSlot inside the Risk popover', () => {
+    renderLoquela({ riskSlot: <button type="button">Check replies: off</button> });
+    expect(screen.queryByText('Check replies: off')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /^risk: /i }));
+    expect(screen.getByText('Check replies: off')).toBeTruthy();
+  });
+
+  it('does not repeat global spend as "session $x / $y" in the toolbar', () => {
+    renderLoquela({ sessionBudget: { spent: 1.23, cap: 50, source: 'daemon' } });
+    expect(screen.queryByText(/session \$/i)).toBeNull();
+  });
+
+  it('the Run button aria text and its visible shortcut hint agree', () => {
+    renderLoquela();
+    const run = screen.getByRole('button', { name: 'Run (Enter)' });
+    expect(run.querySelector('kbd')?.textContent).toBe('↵');
+  });
+
+  it('offers Plan as a send mode, labels the trigger with it, and submits execution_mode "plan"', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Set send mode: Plan' }));
+    expect(screen.getByRole('button', { name: /choose send mode/i })).toHaveTextContent('Plan');
+    expect(screen.queryByLabelText('Interaction mode')).toBeNull();
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'draft the migration' } });
+    fireEvent.keyDown(ta, { key: 'Enter' });
+    expect(onSubmit.mock.calls[0][0].execution_mode).toBe('plan');
+  });
+
+  it('shows Compact Context chip when contextTokens exceeds 24,000 and dispatches /compact (HUMANE-03)', () => {
+    const onSlashCommand = vi.fn(() => true);
+    renderLoquela({ contextTokens: 28_000, onSlashCommand });
+    const chip = screen.getByTestId('loquela-compact-context-chip');
+    expect(chip).toHaveTextContent('Compact Context (~28k tok)');
+    fireEvent.click(chip);
+    expect(onSlashCommand).toHaveBeenCalledWith('/compact', expect.any(Object));
+  });
+
+  it('shows $0.000 (Local · 0% markup) when Local · Mens tier is selected (HUMANE-01)', () => {
+    renderLoquela();
+    fireEvent.click(screen.getByRole('button', { name: /choose model tier/i }));
+    fireEvent.click(screen.getByText('Local · Mens'));
+    expect(screen.getByTestId('loquela-cost-estimate')).toHaveTextContent('$0.000 (Local · 0% markup)');
+  });
+
+  it('offers @term attention chips in @ popover and shows ambient terminal context pill when failed/pinned blocks exist (50-03, 50-04)', async () => {
+    const { publishTerminalBridgeState, resetTerminalBridgeForTests } = await import(
+      '../../../lib/terminalBridge'
+    );
+    resetTerminalBridgeForTests();
+    publishTerminalBridgeState({
+      activeSessionId: 'term-1',
+      blocks: [
+        {
+          id: 5,
+          kind: 'Shell',
+          status: 'Failed',
+          origin: { kind: 'user' },
+          input: 'cargo test',
+          output: [{ stream: 'Stderr', text: 'test failed', ts_ms: 10 }],
+          exit_code: 101,
+          started_ms: 1,
+          ended_ms: 20,
+        },
+      ],
+      pinnedBlockIds: [5],
+    });
+
+    const setChips = vi.fn();
+    renderLoquela({ setChips });
+
+    const ambientPill = screen.getByTestId('loquela-ambient-term-pill');
+    expect(ambientPill).toHaveTextContent('@term:failed');
+    fireEvent.click(ambientPill);
+    expect(setChips).toHaveBeenCalled();
+
+    const ta = screen.getByLabelText('Task composer');
+    fireEvent.change(ta, { target: { value: 'explain @term' } });
+    const termOptions = screen.getAllByTestId('loquela-at-term-option');
+    expect(termOptions.length).toBeGreaterThanOrEqual(4);
+    resetTerminalBridgeForTests();
+  });
+
+  it('shows unified IntelliSensePopover and inline ghost text for slash commands (51-03)', () => {
+    renderLoquela();
+    fireEvent.click(screen.getByRole('button', { name: /choose send mode/i }));
+    fireEvent.click(screen.getByRole('button', { name: /set send mode: background task/i }));
+    const ta = screen.getByLabelText('Task composer') as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: '/ver' } });
+
+    expect(screen.getByTestId('intellisense-popover')).toBeTruthy();
+    expect(screen.getByTestId('loquela-ghost').textContent).toContain('ify');
+
+    fireEvent.keyDown(ta, { key: 'Tab' });
+    expect(screen.getByLabelText('Interaction mode')).toHaveTextContent(/verify/i);
+  });
+
+  it('shows IntelliSensePopover for @ mentions and cycles candidates with ArrowDown (51-03)', () => {
+    renderLoquela();
+    const ta = screen.getByLabelText('Task composer') as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: '@' } });
+
+    expect(screen.getByTestId('intellisense-popover')).toBeTruthy();
+    const termOptions = screen.getAllByTestId('loquela-at-term-option');
+    expect(termOptions.length).toBeGreaterThan(0);
+    expect(termOptions[0].getAttribute('data-active')).toBe('true');
+
+    fireEvent.keyDown(ta, { key: 'ArrowDown' });
+    const updatedTermOptions = screen.getAllByTestId('loquela-at-term-option');
+    expect(updatedTermOptions[1].getAttribute('data-active')).toBe('true');
+  });
+
+  it('supports unified Oversight 1..5 control, @kb scope selector, and Atlas click-to-@ mention insertion (Phases 18, 30, 44)', () => {
+    renderLoquela();
+    const oversightSelect = screen.getByTestId('loquela-oversight-select') as HTMLSelectElement;
+    expect(oversightSelect.value).toBe('balanced');
+    fireEvent.change(oversightSelect, { target: { value: 'cautious' } });
+    expect(oversightSelect.value).toBe('cautious');
+
+    const kbSelect = screen.getByTestId('loquela-kb-scope-select') as HTMLSelectElement;
+    expect(kbSelect.value).toBe('auto');
+    fireEvent.change(kbSelect, { target: { value: 'verified' } });
+    expect(kbSelect.value).toBe('verified');
+
+    fireEvent(
+      window,
+      new CustomEvent('vox:atlas-mention', {
+        detail: { token: '@file:crates/vox-compiler/src/lib.rs' },
+      }),
+    );
+    const ta = screen.getByLabelText('Task composer') as HTMLTextAreaElement;
+    expect(ta.value).toContain('@file:crates/vox-compiler/src/lib.rs');
+  });
+
+  it('allows inline editing of context chip labels', () => {
+    const setChips = vi.fn();
+    renderLoquela({
+      chips: [{ id: 'c1', kind: 'file', label: 'src/old.rs' }],
+      setChips,
+    });
+    fireEvent.click(screen.getByTestId('loquela-chip-edit-c1'));
+    const input = screen.getByTestId('loquela-chip-edit-input-c1');
+    fireEvent.change(input, { target: { value: 'src/new.rs' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(setChips).toHaveBeenCalledWith([{ id: 'c1', kind: 'file', label: 'src/new.rs' }]);
+  });
+
+  it('cycles all chat modifying knobs via Alt keybindings and persists real-time posture via set_session_chat_posture (v2.4)', () => {
+    const onSubmit = vi.fn();
+    renderLoquela({ onSubmit });
+    const ta = screen.getByLabelText('Task composer') as HTMLTextAreaElement;
+
+    // Alt+4 jumps to Genius clutch; Alt+1 jumps to Free; Alt+C cycles to Efficient
+    fireEvent.keyDown(ta, { key: '4', altKey: true });
+    expect(screen.getByRole('radio', { name: 'Genius' })).toHaveAttribute('aria-checked', 'true');
+    fireEvent.keyDown(ta, { key: '1', altKey: true });
+    expect(screen.getByRole('radio', { name: 'Free' })).toHaveAttribute('aria-checked', 'true');
+    fireEvent.keyDown(ta, { key: 'c', altKey: true });
+    expect(screen.getByRole('radio', { name: 'Efficient' })).toHaveAttribute('aria-checked', 'true');
+
+    // Alt+R cycles Risk (moderate -> low)
+    fireEvent.keyDown(ta, { key: 'r', altKey: true });
+    expect(screen.getByRole('button', { name: /^risk: low/i })).toBeTruthy();
+
+    // Alt+T cycles Destination Tier (auto -> local)
+    fireEvent.keyDown(ta, { key: 't', altKey: true });
+    expect(screen.getByRole('button', { name: /choose model tier/i })).toHaveTextContent(/Local/i);
+
+    // Alt+M cycles Send Mode (chat -> task) and Alt+V toggles Interaction mode (act -> verify)
+    fireEvent.keyDown(ta, { key: 'm', altKey: true });
+    expect(screen.getByRole('button', { name: /choose send mode/i })).toHaveTextContent(/Background task/i);
+    fireEvent.keyDown(ta, { key: 'v', altKey: true });
+    expect(screen.getByLabelText('Interaction mode')).toHaveTextContent(/Verify/i);
+
+    // Alt+O cycles Oversight (balanced -> cautious) and Alt+K cycles @kb scope (auto -> docs -> code)
+    fireEvent.keyDown(ta, { key: 'o', altKey: true });
+    expect((screen.getByTestId('loquela-oversight-select') as HTMLSelectElement).value).toBe('cautious');
+    fireEvent.keyDown(ta, { key: 'k', altKey: true });
+    expect((screen.getByTestId('loquela-kb-scope-select') as HTMLSelectElement).value).toBe('docs');
+    fireEvent.keyDown(ta, { key: 'k', altKey: true });
+    expect((screen.getByTestId('loquela-kb-scope-select') as HTMLSelectElement).value).toBe('code');
+
+    // Verify live posture badge reflects the real-time state
+    expect(screen.getByTestId('loquela-live-posture-badge')).toHaveTextContent(
+      'Live · efficiency/low · local · @code',
+    );
+
+    // Verify set_session_chat_posture was invoked to persist across future chat turns
+    expect(mockInvoke).toHaveBeenCalledWith(
+      'set_session_chat_posture',
+      expect.objectContaining({
+        sessionId: null,
+        posture: expect.objectContaining({
+          clutch: 'efficiency',
+          risk: 'low',
+          tier: 'local',
+          mode: 'verify',
+          execution_mode: 'task',
+          oversight_level: 'cautious',
+          kb_scope: 'code',
+        }),
+      }),
+    );
+  });
+
+  it('toggles the Keybind HUD overlay via Alt+/ and allows one-click cycling of real-time knobs (v2.5 KEYBIND-HUD)', () => {
+    renderLoquela();
+    const ta = screen.getByLabelText('Task composer') as HTMLTextAreaElement;
+
+    expect(screen.queryByTestId('loquela-keybind-hud-panel')).toBeNull();
+    fireEvent.keyDown(ta, { key: '/', altKey: true });
+    const hud = screen.getByTestId('loquela-keybind-hud-panel');
+    expect(hud).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('loquela-hud-cycle-clutch'));
+    expect(screen.getByRole('radio', { name: 'Balanced' })).toHaveAttribute('aria-checked', 'true');
+
+    fireEvent.click(screen.getByTestId('loquela-hud-cycle-kb'));
+    expect((screen.getByTestId('loquela-kb-scope-select') as HTMLSelectElement).value).toBe('docs');
+
+    fireEvent.keyDown(ta, { key: 'Escape' });
+    expect(screen.queryByTestId('loquela-keybind-hud-panel')).toBeNull();
+  });
+
+  it('collapses secondary posture knobs behind the progressive-disclosure Execution Posture & Routing popover trigger (v4.0 LOQUELA-CLEANUP)', () => {
+    renderLoquela();
+    const trigger = screen.getByTestId('loquela-posture-trigger');
+    const popover = screen.getByTestId('loquela-posture-popover');
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    expect(popover.className).toContain('sr-only');
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    expect(popover.className).not.toContain('sr-only');
+  });
+
+});
+
+
+

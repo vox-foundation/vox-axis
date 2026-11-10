@@ -1,0 +1,291 @@
+import { describe, it, expect } from 'vitest';
+import {
+  assistantMessagesReadyToPersist,
+  assistantPersistContent,
+  chatReducer,
+  initialChatState,
+  messagesForSession,
+  PENDING_TIMEOUT_MESSAGE,
+  PENDING_TIMEOUT_MS,
+  type ChatState,
+} from './chatCorrelation';
+
+// Build an agent-event frame as delivered over `vox://agent-events`.
+const evt = (kind: Record<string, unknown>) => ({
+  type: 'agentEvent' as const,
+  event: { id: 1, timestamp_ms: 0, kind: kind as { type: string; [k: string]: unknown } },
+});
+
+const assistant = (s: ChatState, runId: string) =>
+  s.messages.find((m) => m.role === 'assistant' && m.runId === runId);
+
+describe('messagesForSession', () => {
+  it('stamps sessionId on both bubbles and filters by session (legacy nulls visible)', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'r1', prompt: 'p', sessionId: 'gui-a' });
+    s = chatReducer(s, { type: 'submit', runId: 'r2', prompt: 'q', sessionId: 'gui-b' });
+    const a = messagesForSession(s, 'gui-a');
+    expect(a).toHaveLength(2); // user + pending assistant
+    expect(a.every((m) => m.sessionId === 'gui-a')).toBe(true);
+    expect(messagesForSession(s, 'gui-b')).toHaveLength(2);
+  });
+});
+
+describe('failRun', () => {
+  it('marks the assistant bubble failed with the given error', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R9', prompt: 'p' });
+    s = chatReducer(s, { type: 'failRun', runId: 'R9', error: 'skipped: duplicate of #4' });
+    expect(assistant(s, 'R9')).toMatchObject({ status: 'failed', error: 'skipped: duplicate of #4' });
+  });
+});
+
+describe('chatReducer', () => {
+  it('submit adds a user message and a pending assistant bubble for the run', () => {
+    const s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi there' });
+    const user = s.messages.find((m) => m.role === 'user' && m.runId === 'R1');
+    expect(user?.text).toBe('hi there');
+    expect(assistant(s, 'R1')).toMatchObject({ text: '', status: 'pending' });
+  });
+
+  it('routes streamed tokens to the assistant bubble via TaskStarted + submit binding', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi' });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R1', taskId: '7' });
+    // task_started establishes agent 3 <-> task 7; tokens carry only agent_id.
+    s = chatReducer(s, evt({ type: 'task_started', task_id: 7, agent_id: 3 }));
+    s = chatReducer(s, evt({ type: 'token_streamed', agent_id: 3, text: 'Hel' }));
+    s = chatReducer(s, evt({ type: 'token_streamed', agent_id: 3, text: 'lo' }));
+    expect(assistant(s, 'R1')).toMatchObject({ text: 'Hello', status: 'streaming', taskId: '7' });
+  });
+
+  it('normalizes numeric event task_id against the string submit task_id', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'q' });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R1', taskId: '42' });
+    s = chatReducer(s, evt({ type: 'task_completed', task_id: 42, agent_id: 9 }));
+    expect(assistant(s, 'R1')?.status).toBe('done');
+  });
+
+  it('task_failed marks the bubble failed with the error text', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'q' });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R1', taskId: '5' });
+    s = chatReducer(s, evt({ type: 'task_failed', task_id: 5, agent_id: 1, error: 'boom' }));
+    expect(assistant(s, 'R1')).toMatchObject({ status: 'failed', error: 'boom' });
+  });
+
+  it('chatPending appends a pending assistant bubble, chatReplySettled replaces it on success', () => {
+    let s = chatReducer(initialChatState, {
+      type: 'chatPending',
+      sessionId: 's1',
+      tempId: 't1',
+      userText: 'hi',
+    });
+    expect(s.messages.some((m) => m.id === 't1' && m.status === 'pending')).toBe(true);
+    s = chatReducer(s, {
+      type: 'chatReplySettled',
+      sessionId: 's1',
+      tempId: 't1',
+      result: {
+        ok: true,
+        message: { id: 'm1', role: 'assistant', text: 'hello back', status: 'done', runId: 't1' },
+      },
+    });
+    expect(s.messages.some((m) => m.id === 'm1' && m.status === 'done')).toBe(true);
+    expect(s.messages.some((m) => m.id === 't1')).toBe(false);
+  });
+
+  it('chatReplySettled marks the pending bubble failed on error', () => {
+    let s = chatReducer(initialChatState, {
+      type: 'chatPending',
+      sessionId: 's1',
+      tempId: 't2',
+      userText: 'hi again',
+    });
+    s = chatReducer(s, {
+      type: 'chatReplySettled',
+      sessionId: 's1',
+      tempId: 't2',
+      result: { ok: false, error: 'daemon unreachable' },
+    });
+    expect(assistant(s, 't2')).toMatchObject({ status: 'failed', error: 'daemon unreachable' });
+  });
+
+  it('ignores a token whose agent has no known task mapping', () => {
+    const s = chatReducer(initialChatState, evt({ type: 'token_streamed', agent_id: 99, text: 'x' }));
+    expect(s.messages).toHaveLength(0);
+  });
+
+  it('appends a system line on tool_timed_out', () => {
+    const s = chatReducer(
+      initialChatState,
+      evt({ type: 'tool_timed_out', agent_id: 2, tool_key: 'vox_run_shell', attempted_budget_ms: 5000 }),
+    );
+    expect(s.messages).toHaveLength(1);
+    expect(s.messages[0].role).toBe('system');
+    expect(s.messages[0].text).toContain('vox_run_shell');
+  });
+
+  it('appends a system line when activity changes to executing', () => {
+    const s = chatReducer(
+      initialChatState,
+      evt({ type: 'activity_changed', agent_id: 4, activity: 'executing', active_skill: 'vox_git_diff' }),
+    );
+    expect(s.messages).toHaveLength(1);
+    expect(s.messages[0].text).toContain('vox_git_diff');
+  });
+
+  it('appends checkpoint line on snapshot_captured', () => {
+    const s = chatReducer(
+      initialChatState,
+      evt({
+        type: 'snapshot_captured',
+        agent_id: 1,
+        snapshot_id: 'snap-abc',
+        file_count: 3,
+        description: 'pre-edit',
+      }),
+    );
+    expect(s.messages[0].text).toContain('Checkpoint saved');
+    expect(s.messages[0].text).toContain('snap-abc');
+  });
+
+  it('stamps modelId on the assistant bubble from cost_incurred via the agent map', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi' });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R1', taskId: '7' });
+    s = chatReducer(s, evt({ type: 'task_started', task_id: 7, agent_id: 3 }));
+    s = chatReducer(s, evt({ type: 'cost_incurred', agent_id: 3, provider: 'openrouter', model: 'anthropic/claude-opus' }));
+    expect(assistant(s, 'R1')?.modelId).toBe('anthropic/claude-opus');
+  });
+
+  it('keeps the first modelId when multiple cost frames arrive', () => {
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi' });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R1', taskId: '7' });
+    s = chatReducer(s, evt({ type: 'task_started', task_id: 7, agent_id: 3 }));
+    s = chatReducer(s, evt({ type: 'cost_incurred', agent_id: 3, provider: 'openrouter', model: 'model-a' }));
+    s = chatReducer(s, evt({ type: 'cost_incurred', agent_id: 3, provider: 'openrouter', model: 'model-b' }));
+    expect(assistant(s, 'R1')?.modelId).toBe('model-a');
+  });
+
+  it('ignores cost_incurred for unknown agents', () => {
+    const s = chatReducer(initialChatState, evt({ type: 'cost_incurred', agent_id: 99, provider: 'x', model: 'm' }));
+    expect(s.messages).toHaveLength(0);
+  });
+});
+
+describe('pendingTimeout watchdog', () => {
+  it('flips a pending bubble older than the timeout to failed with an honest message', () => {
+    const t0 = 1_000_000;
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi', nowMs: t0 });
+    s = chatReducer(s, { type: 'pendingTimeout', nowMs: t0 + PENDING_TIMEOUT_MS + 1 });
+    expect(assistant(s, 'R1')).toMatchObject({
+      status: 'failed',
+      error: PENDING_TIMEOUT_MESSAGE,
+    });
+  });
+
+  it('leaves a fresh pending bubble alone', () => {
+    const t0 = 1_000_000;
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi', nowMs: t0 });
+    s = chatReducer(s, { type: 'pendingTimeout', nowMs: t0 + PENDING_TIMEOUT_MS - 1 });
+    expect(assistant(s, 'R1')?.status).toBe('pending');
+  });
+
+  it('does not touch streaming, done, or failed bubbles even when old', () => {
+    const t0 = 1_000_000;
+    // streaming
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'a', nowMs: t0 });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R1', taskId: '7' });
+    s = chatReducer(s, evt({ type: 'task_started', task_id: 7, agent_id: 3 }));
+    s = chatReducer(s, evt({ type: 'token_streamed', agent_id: 3, text: 'x' }));
+    // done
+    s = chatReducer(s, { type: 'submit', runId: 'R2', prompt: 'b', nowMs: t0 });
+    s = chatReducer(s, { type: 'submitResolved', runId: 'R2', taskId: '8' });
+    s = chatReducer(s, evt({ type: 'task_completed', task_id: 8, agent_id: 4 }));
+    // failed (with its original error preserved)
+    s = chatReducer(s, { type: 'submit', runId: 'R3', prompt: 'c', nowMs: t0 });
+    s = chatReducer(s, { type: 'failRun', runId: 'R3', error: 'boom' });
+
+    s = chatReducer(s, { type: 'pendingTimeout', nowMs: t0 + PENDING_TIMEOUT_MS * 10 });
+    expect(assistant(s, 'R1')?.status).toBe('streaming');
+    expect(assistant(s, 'R2')?.status).toBe('done');
+    expect(assistant(s, 'R3')).toMatchObject({ status: 'failed', error: 'boom' });
+  });
+
+  it('returns the same state object when nothing times out (no spurious re-render)', () => {
+    const t0 = 1_000_000;
+    const s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'hi', nowMs: t0 });
+    const after = chatReducer(s, { type: 'pendingTimeout', nowMs: t0 + 10 });
+    expect(after).toBe(s);
+  });
+
+  it('skips pending bubbles that predate createdAtMs stamping', () => {
+    // Legacy-shaped state: pending assistant without createdAtMs.
+    const s: ChatState = {
+      ...initialChatState,
+      messages: [
+        { id: 'a', role: 'assistant', text: '', status: 'pending', runId: 'R1' },
+      ],
+    };
+    const after = chatReducer(s, { type: 'pendingTimeout', nowMs: Number.MAX_SAFE_INTEGER });
+    expect(after.messages[0].status).toBe('pending');
+  });
+
+  it('resets watchdog timer when research_milestone event arrives before timeout', () => {
+    const t0 = 1_000_000;
+    let s = chatReducer(initialChatState, { type: 'submit', runId: 'R1', prompt: 'deep research', nowMs: t0 });
+    // T = 80s: research_milestone arrives with new timestamp
+    const tMilestone = t0 + 80_000;
+    s = chatReducer(s, {
+      type: 'agentEvent',
+      event: {
+        id: 10,
+        timestamp_ms: tMilestone,
+        kind: {
+          type: 'research_milestone',
+          waves_executed: 2,
+          claims_verified: 8,
+        },
+      },
+    });
+
+    // T = 95s (95s after initial prompt, but only 15s after milestone):
+    // Watchdog check at t0 + 95_000 must NOT abort the assistant bubble
+    s = chatReducer(s, { type: 'pendingTimeout', nowMs: t0 + 95_000 });
+    expect(assistant(s, 'R1')?.status).toBe('pending');
+    expect(assistant(s, 'R1')?.createdAtMs).toBe(tMilestone);
+    expect(assistant(s, 'R1')?.events?.[0]).toMatchObject({
+      kind: 'research_milestone',
+      waves_executed: 2,
+    });
+
+    // T = 80s + 90s + 1ms = tMilestone + PENDING_TIMEOUT_MS + 1ms:
+    // Without any further milestone, it should honestly timeout
+    s = chatReducer(s, { type: 'pendingTimeout', nowMs: tMilestone + PENDING_TIMEOUT_MS + 1 });
+    expect(assistant(s, 'R1')).toMatchObject({
+      status: 'failed',
+      error: PENDING_TIMEOUT_MESSAGE,
+    });
+  });
+});
+
+describe('assistant persistence helpers', () => {
+  it('lists done/failed assistant messages not yet persisted', () => {
+    const messages = [
+      { id: 'a1', role: 'assistant' as const, text: 'ok', status: 'done' as const, runId: 'R1' },
+      { id: 'a2', role: 'assistant' as const, text: '', status: 'streaming' as const, runId: 'R2' },
+      { id: 'a3', role: 'assistant' as const, text: '', status: 'failed' as const, runId: 'R3', error: 'boom' },
+    ];
+    const ready = assistantMessagesReadyToPersist(messages, new Set(['a1']));
+    expect(ready.map((m) => m.id)).toEqual(['a3']);
+  });
+
+  it('prefers error text when persisting a failed bubble', () => {
+    expect(
+      assistantPersistContent({
+        id: 'x',
+        role: 'assistant',
+        text: 'partial',
+        status: 'failed',
+        runId: 'R',
+        error: 'timeout',
+      }),
+    ).toBe('timeout');
+  });
+});

@@ -1,0 +1,53 @@
+import React from 'react';
+import { Glass } from '../../ui/Glass';
+import type { MetricPoint } from '../../../hooks/useMetricSeries';
+
+export const BRASS_STROKE = 'rgb(var(--brass))';
+export const GRID_STROKE = 'var(--color-border-subtle)';
+
+export interface ChartWidgetProps {
+  title: string;
+  series: MetricPoint[];
+}
+
+export function ChartWidgetEmpty({ title }: Pick<ChartWidgetProps, 'title'>) {
+  return (
+    <Glass className="h-full p-5">
+      <h3 className="font-display text-[14px] font-semibold tracking-wide text-text-primary">{title}</h3>
+      <div
+        role="status"
+        className="mt-4 rounded-lg border border-dashed border-border-subtle py-8 text-center text-[11px] text-text-muted"
+      >
+        No data yet — waiting for metric samples.
+      </div>
+    </Glass>
+  );
+}
+
+export function ChartWidgetFrame({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Glass className="flex h-full flex-col p-5">
+      <h3 className="font-display text-[14px] font-semibold tracking-wide text-text-primary">{title}</h3>
+      <div role="img" aria-label={`${title} chart`} className="mt-3 min-h-[160px] flex-1">
+        {children}
+      </div>
+    </Glass>
+  );
+}
+
+export const tooltipStyle = {
+  contentStyle: {
+    background: 'var(--color-bg-elevated)',
+    border: '1px solid var(--color-border-subtle)',
+    borderRadius: 8,
+    fontSize: 11,
+  },
+  labelStyle: { color: 'var(--color-text-secondary)' },
+  itemStyle: { color: BRASS_STROKE },
+} as const;

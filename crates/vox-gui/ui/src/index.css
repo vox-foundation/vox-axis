@@ -1,0 +1,1126 @@
+@import './styles/fonts.css' layer(base);
+@import './styles/tokens.generated.css' layer(base);
+@import './styles/tokens.slate.generated.css' layer(base);
+@import './styles/tokens.contrast.generated.css' layer(base);
+@import './styles/tokens.travertine.generated.css' layer(base);
+@import './styles/dockview-vox.css' layer(base);
+@import 'tailwindcss';
+
+@theme {
+  --color-void: var(--color-bg-base);
+  --color-steel: var(--color-text-muted);
+  --color-brass: rgb(var(--brass));
+  --color-border: var(--color-border-subtle);
+  --color-background: var(--color-bg-base);
+  --color-primary: rgb(var(--brass));
+  --color-accent: var(--color-accent-default);
+
+  --font-display: 'Cinzel', 'Palatino', 'Palatino Linotype', 'Book Antiqua', Georgia, serif;
+  --font-sans: 'Palatino', 'Palatino Linotype', 'Book Antiqua', 'EB Garamond', Georgia, serif;
+  --font-serif: 'Palatino', 'Palatino Linotype', 'Book Antiqua', 'EB Garamond', Georgia, serif;
+  --font-mono: 'Palatino', 'Palatino Linotype', 'Book Antiqua', 'EB Garamond', Georgia, serif;
+
+  --animate-vox-ping: vox-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  --animate-vox-shimmer: vox-shimmer 2.5s infinite linear;
+  --animate-vox-toast-in: vox-toast-in 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  --animate-shimmer: shimmer 1.5s ease-in-out infinite;
+
+  @keyframes vox-ping {
+    75%,
+    100% {
+      transform: scale(2.5);
+      opacity: 0;
+    }
+  }
+  @keyframes vox-shimmer {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(100%);
+    }
+  }
+  @keyframes vox-toast-in {
+    0% {
+      transform: translateX(24px);
+      opacity: 0;
+    }
+    100% {
+      transform: translateX(0);
+      opacity: 1;
+    }
+  }
+  @keyframes shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+}
+
+/* Register Style Dictionary --color-* names as Tailwind colors without
+   emitting a second (circular) declaration that would shadow the hex tokens. */
+@theme reference {
+  --color-bg-base: var(--color-bg-base);
+  --color-bg-surface: var(--color-bg-surface);
+  --color-bg-elevated: var(--color-bg-elevated);
+  --color-text-primary: var(--color-text-primary);
+  --color-text-secondary: var(--color-text-secondary);
+  --color-text-muted: var(--color-text-muted);
+  --color-border-subtle: var(--color-border-subtle);
+  --color-border-strong: var(--color-border-strong);
+  --color-accent-secondary: var(--color-accent-secondary);
+  --color-overlay-subtle: var(--color-overlay-subtle);
+  --color-overlay-hover: var(--color-overlay-hover);
+  --color-overlay-solid: var(--color-overlay-solid);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility custom-scrollbar {
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: var(--color-overlay-subtle);
+    border-radius: 10px;
+  }
+  &::-webkit-scrollbar-thumb:hover {
+    background: var(--color-overlay-hover);
+  }
+}
+
+@utility vox-range {
+  /* Range slider styles */
+  &::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    background: var(--color-text-primary);
+    border: 2px solid rgb(var(--brass));
+    border-radius: 50%;
+    cursor: pointer;
+  }
+}
+
+@utility vox-rule {
+  /* Roman ornament utilities */
+  height: 1px;
+  background: linear-gradient(90deg, rgb(var(--brass)), rgb(var(--brass) / 0));
+}
+
+/* Latin inscriptions cap a word with a rule above it (`overline`). Axis
+   metrics put the rule UNDER the figure, with room to breathe — override
+   Tailwind's `overline` so every label that used the old convention follows
+   the theme instead of being patched one component at a time. */
+@utility overline {
+  text-decoration-line: underline;
+  text-underline-offset: 0.4em;
+  text-decoration-thickness: 1px;
+  text-decoration-color: currentcolor;
+}
+
+@utility vox-metric-rule {
+  display: block;
+  height: 2px;
+  margin-top: 0.5rem;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.55;
+}
+
+@utility vox-tick {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  pointer-events: none;
+}
+
+@utility vox-tick-tl {
+  top: 9px;
+  left: 9px;
+  border-top: 1px solid rgb(var(--brass));
+  border-left: 1px solid rgb(var(--brass));
+}
+
+@utility vox-tick-tr {
+  top: 9px;
+  right: 9px;
+  border-top: 1px solid var(--color-accent-secondary);
+  border-right: 1px solid var(--color-accent-secondary);
+}
+
+@utility vox-display {
+  font-family: var(--font-family-display);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+@utility ds-section-head {
+  /* Section heading — migrated from ds/components.css `.ds-section-head` (B7:
+     the ds/ sheet is not imported by the app, so the class was dead). A divider
+     that introduces a section UNDERLINES its heading (border-bottom beneath the
+     label) — it never caps the section with a top border above the first label.
+     Keep in sync with ds/components.css. */
+  font-family: var(--font-family-display);
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  padding-bottom: 4px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+@layer base {
+  /* Native controls (<select> option popups, etc.) render with browser/OS
+     UA styling that Tailwind classes on the element itself can't reach —
+     without this, Windows renders them in light mode regardless of the
+     app's own theme, and since `color` IS inherited onto <option> but the
+     native popup background is not, the result is white text on a white
+     background (not just a mismatched-but-legible light popup). */
+  :root, [data-theme="arcane"] {
+    color-scheme: light;
+    --color-surface-elevated: var(--color-bg-elevated);
+    --color-surface-subtle: var(--color-bg-surface);
+  }
+  [data-theme="glacier"], [data-theme="travertine"] {
+    color-scheme: light;
+    --color-surface-elevated: var(--color-bg-elevated);
+    --color-surface-subtle: var(--color-bg-surface);
+  }
+  [data-theme="void"], [data-theme="slate"], [data-theme="high-contrast"] {
+    color-scheme: dark;
+    --color-surface-elevated: var(--color-bg-elevated);
+    --color-surface-subtle: var(--color-bg-surface);
+  }
+
+  html, body, #root {
+    height: 100%; margin: 0; overflow: hidden;
+    background: var(--color-bg-base);
+    color: var(--color-text-primary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-synthesis: none;
+    font-family: var(--font-sans, 'Palatino', 'Palatino Linotype', 'Book Antiqua', 'EB Garamond', Georgia, serif);
+  }
+
+  /* Theme-contract display typography (`var(--font-display)` — Cinzel in arcane/glacier,
+     Inter in slate) across all headings, buttons, tabs, column headers, navigation, and frieze banners. */
+  h1, h2, h3, h4, h5, h6,
+  button,
+  [role="tab"],
+  [role="columnheader"],
+  th,
+  legend,
+  nav button,
+  header button,
+  footer button,
+  [data-roman-frieze="true"] h1,
+  [data-roman-frieze="true"] span,
+  .font-display {
+    font-family: var(--font-display, 'Cinzel', 'Palatino', 'Palatino Linotype', 'Book Antiqua', Georgia, serif) !important;
+    letter-spacing: 0.04em;
+  }
+
+  /* Eliminate jagged bitmap/IBM terminal monospace on UI chrome (buttons, pills,
+     badges, status bar tiles, headers) while keeping crisp tabular numbers. */
+  button.font-mono,
+  select.font-mono,
+  nav .font-mono,
+  header .font-mono,
+  footer .font-mono,
+  aside .font-mono:not(pre):not(code),
+  main button .font-mono {
+    font-family: var(--font-display, 'Cinzel', 'Palatino', 'Palatino Linotype', 'Book Antiqua', Georgia, serif) !important;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.03em;
+  }
+
+  main span.font-mono:not(pre *):not(code *),
+  main div.font-mono:not(pre *):not(code *) {
+    font-family: var(--font-sans, 'Palatino', 'Palatino Linotype', 'Book Antiqua', 'EB Garamond', Georgia, serif);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.015em;
+  }
+
+  /* ─── Plate 2 Stylized 3D Riveted Brass & Chiseled White Carrara Marble Controls ─── */
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="tab"][aria-selected="true"] {
+    background: linear-gradient(180deg, #F3E5AB 0%, #DFC878 55%, #C9A642 100%) !important;
+    color: #1C140C !important;
+    border: 1.5px solid #9A7014 !important;
+    box-shadow:
+      0 3px 10px rgba(28, 20, 12, 0.25),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9),
+      inset 0 -1px 2px rgba(138, 106, 38, 0.35) !important;
+    font-weight: 700 !important;
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="tab"][aria-selected="false"] {
+    background: linear-gradient(180deg, #FAF6EE 0%, #EFE6D5 100%) !important;
+    border: 1px solid rgba(197, 155, 39, 0.65) !important;
+    color: #2B1E10 !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  }
+
+  /* White/Cream Carrara Marble Table & Treegrid Column Header Band (Concept Art Plate A) */
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main thead tr,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="row"][aria-rowindex="1"] {
+    background: linear-gradient(180deg, #F3ECE0 0%, #E2D5BE 100%) !important;
+    color: #1F170E !important;
+    border-bottom: 2px solid #B88E28 !important;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85), 0 2px 6px rgba(28, 20, 12, 0.16);
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main thead th,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="columnheader"] {
+    color: #1F170E !important;
+    font-family: var(--font-display, 'Cinzel', 'Palatino', Georgia, serif) !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.08em !important;
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.65);
+  }
+
+  /* Stylized 3D Riveted Brass & Carved Carrara Marble Action Buttons inside surfaces */
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) button:not([role="tab"]):not([data-roman-gauge="true"]):not([disabled]) {
+    position: relative;
+    background-color: #FAF5E8 !important;
+    background-image:
+      radial-gradient(circle at 5px 50%, rgba(184, 134, 11, 0.55) 1.2px, transparent 1.8px),
+      radial-gradient(circle at calc(100% - 5px) 50%, rgba(184, 134, 11, 0.55) 1.2px, transparent 1.8px),
+      linear-gradient(180deg, rgba(252, 249, 242, 0.96) 0%, rgba(238, 228, 208, 0.96) 100%) !important;
+    border-color: rgba(197, 155, 39, 0.78) !important;
+    color: #1C140C !important;
+    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 220ms ease, filter 220ms ease;
+    box-shadow:
+      0 2px 6px rgba(28, 20, 12, 0.18),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92),
+      inset 0 -1px 0 rgba(184, 134, 11, 0.28);
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) button:not([role="tab"]):not([data-roman-gauge="true"]):not([disabled]):hover {
+    transform: translateY(-1px);
+    filter: brightness(1.03);
+    box-shadow:
+      0 4px 12px rgba(28, 20, 12, 0.24),
+      0 0 10px rgba(212, 175, 55, 0.32),
+      inset 0 1px 0 rgba(255, 255, 255, 0.96);
+  }
+
+  /* Luminous Carrara Marble Top Cornice & Travertine Relief on Surface Cards */
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main .rounded-xl:not([data-roman-frieze="true"]):not([data-testid="console-root"]),
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main .rounded-2xl:not([data-roman-frieze="true"]),
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main > div > section.rounded-xl,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main > div > div > .rounded-xl:not([data-roman-frieze="true"]):not([data-testid="console-root"]) {
+    box-shadow:
+      0 6px 18px rgba(28, 20, 12, 0.16),
+      inset 0 1.5px 0 rgba(255, 255, 255, 0.88),
+      inset 0 -1px 0 rgba(197, 155, 39, 0.28);
+    border-color: rgba(197, 155, 39, 0.68);
+  }
+
+  /* Reusable Sunlit Cream Carrara Marble & Travertine Stone Tablet utility */
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) .vox-marble-tablet {
+    background-image:
+      linear-gradient(180deg, rgba(250, 246, 237, 0.96) 0%, rgba(240, 231, 214, 0.95) 55%, rgba(230, 218, 196, 0.96) 100%),
+      url('/assets/romanesque/carrara-seamless-stone.jpg') !important;
+    background-size: cover !important;
+    background-position: center !important;
+    border: 1.5px solid #C59B27 !important;
+    color: #1E150C !important;
+    box-shadow:
+      0 6px 18px rgba(28, 20, 12, 0.2),
+      inset 0 1.5px 0 rgba(255, 255, 255, 0.92),
+      inset 0 -1px 0 rgba(158, 123, 47, 0.42) !important;
+  }
+
+  /* White/Cream Carrara Marble & Gold Cornice Banner Strip for Cards, Tables & Panels */
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main section > header:not([data-roman-frieze="true"]),
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main details > summary,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="tablist"] {
+    background-image:
+      linear-gradient(90deg, rgba(250, 246, 238, 0.94) 0%, rgba(242, 235, 221, 0.9) 50%, rgba(250, 246, 238, 0.94) 100%),
+      url('/assets/romanesque/carrara-acanthus-header-band.jpg') !important;
+    background-size: cover !important;
+    background-position: center !important;
+    border: 1.5px solid #C59B27 !important;
+    border-radius: 10px;
+    padding: 0.35rem 0.65rem;
+    color: #1E150C !important;
+    box-shadow:
+      0 3px 10px rgba(28, 20, 12, 0.16),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main section > header:not([data-roman-frieze="true"]) h1,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main section > header:not([data-roman-frieze="true"]) h2,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main section > header:not([data-roman-frieze="true"]) h3,
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main section > header:not([data-roman-frieze="true"]) h4 {
+    color: #1E150C !important;
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main section > header:not([data-roman-frieze="true"]) p {
+    color: #4A3620 !important;
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main details > summary {
+    color: #1E150C !important;
+    font-weight: 700 !important;
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="tablist"] button[role="tab"][aria-selected="false"] {
+    background: linear-gradient(180deg, #FAF6EE 0%, #EFE6D5 100%) !important;
+    color: #2B1E10 !important;
+    border: 1px solid rgba(197, 155, 39, 0.65) !important;
+  }
+
+  html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main [role="tablist"] button[role="tab"][aria-selected="true"] {
+    background: linear-gradient(180deg, #F3E5AB 0%, #DFC878 100%) !important;
+    color: #1C140C !important;
+    border: 1.5px solid #9A7014 !important;
+    box-shadow: 0 2px 6px rgba(28, 20, 12, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.85) !important;
+  }
+
+  /* ─── Tasteful Classical Animations (Sunlight Marble Sheen, Brass Glint, Dial Breathe) ─── */
+  @keyframes vox-marble-sheen {
+    0%, 100% {
+      background-position: -180% 0, center, center;
+    }
+    50% {
+      background-position: 180% 0, center, center;
+    }
+  }
+
+  @keyframes vox-dial-breathe {
+    0%, 100% {
+      filter: drop-shadow(0 0 2px rgba(212, 175, 55, 0.35));
+    }
+    50% {
+      filter: drop-shadow(0 0 6px rgba(212, 175, 55, 0.78));
+    }
+  }
+
+  @keyframes vox-brass-glint {
+    0%, 100% {
+      box-shadow: 0 0 10px rgba(212, 175, 55, 0.28), inset 0 1px 2px rgba(255, 245, 210, 0.55);
+    }
+    50% {
+      box-shadow: 0 0 18px rgba(212, 175, 55, 0.58), inset 0 1px 4px rgba(255, 250, 230, 0.85);
+    }
+  }
+
+  @keyframes vox-tablet-rise {
+    from {
+      opacity: 0.92;
+      transform: translateY(3px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .vox-animate-marble-sheen {
+    animation: vox-marble-sheen 8s ease-in-out infinite;
+  }
+
+  .vox-animate-dial-breathe {
+    animation: vox-dial-breathe 3.4s ease-in-out infinite;
+  }
+
+  .vox-animate-brass-glint {
+    animation: vox-brass-glint 4.2s ease-in-out infinite;
+  }
+
+  main [data-roman-frieze="true"] {
+    animation: vox-tablet-rise 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  /* Theme-bound monospace typography (`var(--font-mono)` — Palatino tabular numerals in arcane/glacier,
+     ui-monospace in slate/high-contrast) with zero Courier/Arial leaks */
+  .font-mono,
+  pre,
+  code,
+  kbd,
+  samp,
+  .cm-editor,
+  .cm-content {
+    font-family: var(--font-mono, 'Palatino', 'Palatino Linotype', 'Book Antiqua', 'EB Garamond', Georgia, serif) !important;
+    font-variant-numeric: tabular-nums;
+    font-variant-ligatures: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  select:not([data-unified-knob="true"]) {
+    appearance: none;
+    background-color: var(--color-bg-elevated);
+    border: 1px solid var(--color-border-strong);
+    border-radius: 6px;
+    padding: 0.25rem 1.75rem 0.25rem 0.625rem;
+    color: var(--color-text-primary);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12' fill='none' stroke='%238C6214' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m3 4.5 3 3 3-3'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.5rem center;
+    background-size: 10px 10px;
+  }
+}
+
+@layer components {
+  /* Theme-adaptive scrollbar across all surfaces */
+  * { scrollbar-width: thin; scrollbar-color: var(--color-border-subtle) transparent; }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: var(--color-border-subtle); border-radius: 8px; }
+  *::-webkit-scrollbar-thumb:hover { background: var(--color-border-strong); }
+}
+
+/* ─── Global accessibility: focus ring ──────────────────────────────────── */
+*:focus-visible {
+  outline: 3px solid var(--color-accent-default);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ─── Respect prefers-reduced-motion ────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.attention-budget-meter {
+  background: var(--color-bg-surface);
+  border: 1.5px solid var(--color-border-strong);
+  border-radius: 12px;
+  padding: 0.875rem 1rem;
+  backdrop-filter: blur(12px);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.15) inset, 0 6px 18px rgba(28, 20, 12, 0.16);
+}
+
+.attention-budget-meter[data-collapsed="true"] {
+  padding: 0.5rem 0.75rem;
+}
+
+.attention-budget-meter header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.attention-budget-meter[data-collapsed="true"] header {
+  margin-bottom: 0.375rem;
+}
+
+.attention-budget-meter__summary {
+  font-family: var(--font-sans, 'Palatino', 'Palatino Linotype', Georgia, serif);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.7rem;
+  color: var(--color-text-secondary);
+}
+
+.attention-budget-meter__toggle {
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  line-height: 1;
+  padding: 0.125rem 0.25rem;
+  border-radius: 4px;
+}
+
+.attention-budget-meter__toggle:hover {
+  color: var(--color-text-primary);
+  background: var(--color-overlay-hover);
+}
+
+.attention-budget-meter__bar--compact {
+  height: 3px;
+  margin-bottom: 0;
+}
+
+.attention-budget-meter header span:first-child {
+  font-family: var(--font-display, inherit);
+  font-weight: 600;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--color-text-primary);
+}
+
+.attention-budget-meter header span:last-child {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  background: var(--color-bg-elevated);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-strong);
+}
+
+.attention-budget-meter div[role="meter"] {
+  height: 8px;
+  width: 100%;
+  background: var(--color-overlay-subtle);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--color-border-subtle);
+}
+
+.attention-budget-meter__fill {
+  height: 100%;
+  background: var(--color-accent-default);
+  border-radius: 4px;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.attention-budget-meter p {
+  margin: 0.25rem 0 0 0;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.attention-budget-meter p:last-child {
+  margin-top: 0.375rem;
+  font-family: var(--font-sans, 'Palatino', 'Palatino Linotype', Georgia, serif);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.7rem;
+  color: var(--color-text-secondary);
+}
+
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Milestone v6.5 Universal White/Cream Carrara Marble & Burnished Gold
+   Surface Normalization Across Light Themes (`arcane` & `glacier`/`travertine`)
+   ────────────────────────────────────────────────────────────────────────── */
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) main {
+  background-color: var(--color-bg-base);
+  background-image:
+    linear-gradient(180deg, rgba(250, 246, 238, 0.88) 0%, rgba(244, 237, 223, 0.85) 88%, rgba(238, 228, 208, 0.82) 100%),
+    url('/assets/romanesque/carrara-seamless-stone.jpg');
+  background-repeat: no-repeat, no-repeat;
+  background-position: center, center;
+  background-size: cover, cover;
+  color: var(--color-text-primary);
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) table {
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1.5px solid #C59B27;
+  border-radius: 10px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #FAF6EE 0%, #F2E9D8 100%) !important;
+  color: #1C140C !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 6px 18px rgba(28, 20, 12, 0.16);
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) thead {
+  background: linear-gradient(180deg, #F3ECE0 0%, #E2D5BE 100%) !important;
+  border-bottom: 2px solid #B88E28 !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) thead th {
+  font-family: var(--font-display);
+  color: #1E160D !important;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 700 !important;
+  border-bottom: 1.5px solid #B88E28 !important;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.75);
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody tr {
+  background-color: #FAF6EE !important;
+  color: #1C140C !important;
+  border-bottom: 1px solid rgba(197, 155, 39, 0.32);
+  transition: background-color 150ms ease;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody tr:nth-child(even) {
+  background-color: #F3ECE0 !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody tr:hover {
+  background-color: #EFE2C6 !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody td {
+  color: #1C140C !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="text"],
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="search"],
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="number"],
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="url"],
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="password"],
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) textarea,
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) select {
+  background-color: #FAF5E8 !important;
+  border: 1.5px solid rgba(197, 155, 39, 0.72) !important;
+  color: #1C140C !important;
+  border-radius: 8px;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input::placeholder,
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) textarea::placeholder {
+  color: #6B5335 !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="checkbox"],
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(main, [role="dialog"]) input[type="radio"] {
+  accent-color: #9A7014;
+}
+
+/* Convert all legacy dark card/panel/row backgrounds across surfaces, sidebar, portals & dialogs to Sunlit White/Cream Carrara Marble when in White/Gold themes */
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  [class*="bg-[#0"],
+  [class*="bg-[#1"],
+  [class*="bg-[#2"],
+  [class*="bg-[#3"],
+  [class*="bg-black"],
+  [class*="bg-stone-9"],
+  [class*="bg-stone-8"],
+  [class*="bg-neutral-9"],
+  [class*="bg-neutral-8"],
+  [class*="bg-zinc-9"],
+  [class*="bg-zinc-8"],
+  [class*="bg-slate-9"],
+  [class*="bg-slate-8"],
+  [class*="bg-amber-950"],
+  [class*="bg-amber-900"],
+  [class*="bg-emerald-950"],
+  [class*="bg-emerald-900"],
+  [class*="bg-rose-950"],
+  [class*="bg-rose-900"],
+  [class*="bg-red-950"],
+  [class*="from-[#0"],
+  [class*="from-[#1"],
+  [class*="from-[#2"],
+  [class*="from-[#3"],
+  [class*="from-[#4"],
+  [class*="to-[#0"],
+  [class*="to-[#1"],
+  [class*="to-[#2"]
+):not([data-roman-medallion="true"]):not([data-roman-wax-seal="true"]):not([data-roman-wax-seal="true"] *):not([data-theme-swatch="true"]):not([data-testid="urbs-loupe-diff-hunk"]) {
+  background-color: #FAF5E8 !important;
+  background-image: linear-gradient(180deg, rgba(250, 246, 238, 0.96) 0%, rgba(240, 231, 214, 0.96) 100%) !important;
+  color: #1C140C !important;
+  border-color: rgba(197, 155, 39, 0.65) !important;
+}
+
+/* Normalize light/pastel text utilities across surfaces, sidebar, portals & dialogs to High-Contrast Dark Espresso / Umber / Bronze / Crimson / Laurel Ink */
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .text-white,
+  [class*="text-white/"],
+  [class*="text-[#F"],
+  [class*="text-[#f"],
+  [class*="text-[#E"],
+  [class*="text-[#e"],
+  [class*="text-[#D"],
+  [class*="text-[#d"],
+  [class*="text-[#C"],
+  [class*="text-[#c"],
+  [class*="text-[#B"],
+  [class*="text-[#b"],
+  [class*="text-[#A"],
+  [class*="text-[#a"],
+  [class*="text-[#9"],
+  [class*="text-[#8"],
+  [class*="text-[#7"],
+  [class*="text-stone-1"],
+  [class*="text-stone-2"],
+  [class*="text-stone-3"],
+  [class*="text-stone-4"],
+  [class*="text-stone-5"],
+  [class*="text-neutral-1"],
+  [class*="text-neutral-2"],
+  [class*="text-neutral-3"],
+  [class*="text-neutral-4"],
+  [class*="text-neutral-5"],
+  [class*="text-zinc-1"],
+  [class*="text-zinc-2"],
+  [class*="text-zinc-3"],
+  [class*="text-zinc-4"],
+  [class*="text-zinc-5"],
+  [class*="text-slate-1"],
+  [class*="text-slate-2"],
+  [class*="text-slate-3"],
+  [class*="text-slate-4"],
+  [class*="text-slate-5"],
+  [class*="text-gray-1"],
+  [class*="text-gray-2"],
+  [class*="text-gray-3"],
+  [class*="text-gray-4"],
+  [class*="text-amber-1"],
+  [class*="text-amber-2"],
+  [class*="text-amber-3"],
+  [class*="text-amber-4"],
+  [class*="text-amber-5"],
+  [class*="text-yellow-1"],
+  [class*="text-yellow-2"],
+  [class*="text-yellow-3"],
+  [class*="text-yellow-4"],
+  [class*="text-yellow-5"],
+  [class*="text-orange-2"],
+  [class*="text-orange-3"],
+  [class*="text-orange-4"],
+  .text-brass
+):not([data-roman-medallion="true"] *):not([data-roman-wax-seal="true"]):not([data-roman-wax-seal="true"] *) {
+  color: #1C140C !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .text-cyan,
+  .text-cyan-300,
+  .text-cyan-400,
+  .text-sky-300,
+  .text-sky-400,
+  .text-teal-300,
+  .text-teal-400,
+  [class*="text-blue-2"],
+  [class*="text-blue-3"],
+  [class*="text-blue-4"],
+  [class*="text-indigo-2"],
+  [class*="text-indigo-3"],
+  [class*="text-indigo-4"],
+  [class*="text-purple-2"],
+  [class*="text-purple-3"],
+  [class*="text-purple-4"]
+):not([data-roman-medallion="true"] *) {
+  color: #5C4014 !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .text-emerald-200,
+  .text-emerald-300,
+  .text-emerald-400,
+  .text-emerald-500,
+  .text-green-200,
+  .text-green-300,
+  .text-green-400,
+  .text-green-500
+):not([data-roman-medallion="true"] *) {
+  color: #14532D !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  [class*="text-rose-1"],
+  [class*="text-rose-2"],
+  [class*="text-rose-3"],
+  [class*="text-rose-4"],
+  [class*="text-red-2"],
+  [class*="text-red-3"],
+  [class*="text-red-4"]
+):not([data-roman-medallion="true"] *) {
+  color: #7F1D1D !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .border-cyan,
+  .border-cyan-400,
+  .border-cyan-500,
+  .border-sky-400,
+  .border-sky-500,
+  .border-teal-400,
+  .border-teal-500,
+  .border-emerald-400\/30,
+  .border-emerald-500\/30,
+  .border-emerald-500\/40
+) {
+  border-color: rgba(197, 155, 39, 0.68) !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .bg-cyan\/10,
+  .bg-cyan-500\/10,
+  .bg-cyan-500\/15,
+  .bg-sky-500\/10,
+  .bg-emerald-400\/10,
+  .bg-emerald-500\/10,
+  .bg-emerald-500\/15
+) {
+  background-color: rgba(243, 229, 171, 0.55) !important;
+}
+
+html:not([data-theme="void"]):not([data-theme="slate"]):not([data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .bg-emerald-400,
+  .bg-emerald-500
+) {
+  background-color: #1B6B3A !important;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Dark & High-Contrast Theme Normalization
+   (`html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]`)
+   Uses semantic CSS variables (`var(--color-bg-*)`, `var(--color-text-*)`) so
+   both `slate` (`#0c0e10`/`#15191c`) and `high-contrast` (`#000000`/`#ffffff`)
+   render with their exact contract palette across all surfaces, portals, and dialogs.
+   ────────────────────────────────────────────────────────────────────────── */
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) .vox-backdrop-marble,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) [data-roman-pillar="true"] {
+  display: none !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) .vox-backdrop-base {
+  background: var(--color-bg-base) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) .vox-backdrop-glow {
+  background: radial-gradient(circle, var(--color-overlay-subtle) 0%, transparent 65%) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) main {
+  background-color: var(--color-bg-base) !important;
+  background-image: none !important;
+  color: var(--color-text-primary) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(
+  .vox-marble-tablet,
+  aside,
+  header,
+  footer,
+  [data-roman-frieze="true"],
+  main section > header:not([data-roman-frieze="true"]),
+  main details > summary,
+  main [role="tablist"],
+  .vox-sidebar-header,
+  .vox-sidebar-item-active
+) {
+  background-color: var(--color-bg-surface) !important;
+  background-image: none !important;
+  border-color: var(--color-border-subtle) !important;
+  color: var(--color-text-primary) !important;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+  animation: none !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) .vox-sidebar-item-active {
+  background-color: var(--color-bg-elevated) !important;
+  border-color: var(--color-accent-default) !important;
+  color: var(--color-text-primary) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) [data-roman-medallion="true"] {
+  background: var(--color-bg-elevated) !important;
+  border-color: var(--color-accent-default) !important;
+  color: var(--color-accent-default) !important;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4) !important;
+  animation: none !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .bg-overlay-solid,
+  .bg-overlay-subtle,
+  .bg-bg-surface,
+  .bg-bg-elevated,
+  .bg-surface-elevated,
+  .bg-surface-subtle,
+  [class*="bg-[#FFF"],
+  [class*="bg-[#fff"],
+  [class*="bg-[#FAF"],
+  [class*="bg-[#faf"],
+  [class*="bg-[#F8F"],
+  [class*="bg-[#F6F"],
+  [class*="bg-[#f6f"],
+  [class*="bg-[#F5E"],
+  [class*="bg-[#F4E"],
+  [class*="bg-[#F3E"],
+  [class*="bg-[#F2E"],
+  [class*="bg-[#EFE"],
+  [class*="bg-[#efe"],
+  [class*="bg-[#EDE"],
+  [class*="bg-[#EAE"],
+  [class*="bg-[#E6D"],
+  [class*="bg-[#DFD"],
+  [class*="bg-[#dfd"],
+  [class*="bg-[#DDD"],
+  [class*="bg-[#D8C"],
+  [class*="bg-[#D0C"],
+  [class*="bg-[#C8B"],
+  [class*="bg-[#C5B"],
+  [class*="from-[#FAF"],
+  [class*="from-[#F9F"],
+  [class*="from-[#F8F"],
+  [class*="from-[#F7F"],
+  [class*="from-[#F6F"],
+  [class*="from-[#F5E"],
+  [class*="from-[#F4E"],
+  [class*="from-[#F3E"],
+  [class*="from-[#F2E"],
+  [class*="from-[#EFE"],
+  [class*="from-[#EBE"],
+  [class*="from-[#DFD"],
+  [class*="from-[#D8C"],
+  [class*="to-[#F7F"],
+  [class*="to-[#EFE"],
+  [class*="to-[#EDE"],
+  [class*="to-[#EAE"],
+  [class*="to-[#E6D"],
+  [class*="to-[#E2D"],
+  [class*="to-[#DFD"],
+  [class*="to-[#DFC"],
+  [class*="to-[#DDD"],
+  [class*="to-[#D8C"]
+):not([data-theme-swatch="true"]) {
+  background-color: var(--color-bg-surface) !important;
+  background-image: none !important;
+  border-color: var(--color-border-subtle) !important;
+  color: var(--color-text-primary) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(body, main, aside, nav, header, footer, [role="dialog"], [role="menu"], [role="tooltip"]) :is(
+  .text-text-primary,
+  .text-text-secondary,
+  .text-text-muted,
+  [class*="text-[#1"],
+  [class*="text-[#2"],
+  [class*="text-[#3"],
+  [class*="text-[#4"],
+  [class*="text-[#5"],
+  [class*="text-[#6"],
+  [class*="text-[#7"],
+  [class*="text-[#8"],
+  [class*="text-[#9"]
+):not([data-roman-brass-plaque="true"]):not([data-roman-brass-plaque="true"] *) {
+  color: var(--color-text-primary) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) button:not([role="tab"]):not([data-roman-gauge="true"]):not([disabled]) {
+  background-color: var(--color-bg-elevated) !important;
+  background-image: none !important;
+  border-color: var(--color-border-strong) !important;
+  color: var(--color-text-primary) !important;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) main [role="tab"][aria-selected="true"],
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) main [role="tablist"] button[role="tab"][aria-selected="true"] {
+  background: var(--color-bg-elevated) !important;
+  color: var(--color-accent-default) !important;
+  border: 1.5px solid var(--color-accent-default) !important;
+  box-shadow: 0 2px 8px var(--color-overlay-hover) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) main [role="tab"][aria-selected="false"],
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) main [role="tablist"] button[role="tab"][aria-selected="false"] {
+  background: var(--color-bg-surface) !important;
+  color: var(--color-text-secondary) !important;
+  border: 1px solid var(--color-border-subtle) !important;
+  box-shadow: none !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) table {
+  background: var(--color-bg-surface) !important;
+  border-color: var(--color-border-subtle) !important;
+  color: var(--color-text-primary) !important;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) thead,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) thead tr,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) [role="row"][aria-rowindex="1"] {
+  background: var(--color-bg-elevated) !important;
+  border-bottom: 1.5px solid var(--color-border-strong) !important;
+  color: var(--color-text-primary) !important;
+  box-shadow: none !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) thead th,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) [role="columnheader"] {
+  color: var(--color-text-primary) !important;
+  border-bottom-color: var(--color-border-strong) !important;
+  text-shadow: none !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody tr {
+  background-color: var(--color-bg-surface) !important;
+  color: var(--color-text-primary) !important;
+  border-bottom-color: var(--color-border-subtle) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody tr:nth-child(even) {
+  background-color: var(--color-bg-elevated) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody tr:hover {
+  background-color: var(--color-overlay-hover) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) tbody td {
+  color: var(--color-text-primary) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) textarea,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) select,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) select:not([data-unified-knob="true"]) {
+  background-color: var(--color-bg-base) !important;
+  border-color: var(--color-border-subtle) !important;
+  color: var(--color-text-primary) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) input::placeholder,
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) :is(main, [role="dialog"]) textarea::placeholder {
+  color: var(--color-text-muted) !important;
+}
+
+:is(html[data-theme="void"], html[data-theme="slate"], html[data-theme="high-contrast"]) .attention-budget-meter {
+  background: var(--color-bg-surface) !important;
+  border-color: var(--color-border-subtle) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Bare-browser / preview escape hatch.
+   Tauri injects window.__TAURI_INTERNALS__; outside it (vite preview, headless
+   screenshot capture) main.tsx tags <html> with `.no-tauri`. backdrop-filter
+   blur cannot be composited under software rendering and hangs screenshot
+   capture, so neutralize it there. The real Tauri app keeps the glass blur.
+   ────────────────────────────────────────────────────────────────────────── */
+.no-tauri,
+.no-tauri *,
+.no-tauri *::before,
+.no-tauri *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Phase 386 (`ROMA-V66-THEME-CONTRACT-01..04`): Universal Single-Line Control
+   & New-Component Theme Contract Guardrails
+   ────────────────────────────────────────────────────────────────────────── */
+button.inline-flex:not(.whitespace-normal):not([data-multiline="true"]),
+[role="tab"]:not(.whitespace-normal):not([data-multiline="true"]),
+.vox-pill-badge {
+  white-space: nowrap;
+}
