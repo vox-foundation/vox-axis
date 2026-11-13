@@ -15,7 +15,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SURFACE_REGISTRY } from '../../src/generated/surfaceRegistry.generated';
 import { discoverAllGuiSurfacesAndPanels } from '../../src/lib/cvSurfaceDiscovery';
@@ -43,6 +43,8 @@ import {
 } from '../../src/lib/cvFlywheel';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const UI_ROOT = join(__dirname, '..', '..');
+const toUiRelativePath = (p: string): string => relative(UI_ROOT, p).replace(/\\/g, '/');
 const OUT_DIR = join(__dirname, '..', '..', 'artifacts', 'cv-flywheel');
 const SURFACES_OUT_DIR = join(OUT_DIR, 'surfaces');
 const SCREENS_DIR = join(__dirname, '..', 'screens');
@@ -194,7 +196,7 @@ test.describe('Shared-Package CV Flywheel (@ngi/platform-ssot) — Chat, Docking
     records['chat-default'] = {
       surfaceId: 'chat-default',
       stage: STAGE === 'before' ? 'before' : 'after',
-      screenshotPath: chatPngPath,
+      screenshotPath: toUiRelativePath(chatPngPath),
       pixelSignals: chatPixels,
       domAudit: chatDom,
       vlmRubric: chatRubric,
@@ -227,7 +229,7 @@ test.describe('Shared-Package CV Flywheel (@ngi/platform-ssot) — Chat, Docking
     records['loquela-knobs'] = {
       surfaceId: 'loquela-knobs',
       stage: STAGE === 'before' ? 'before' : 'after',
-      screenshotPath: knobsPngPath,
+      screenshotPath: toUiRelativePath(knobsPngPath),
       pixelSignals: knobsPixels,
       domAudit: knobsDom,
       vlmRubric: knobsRubric,
@@ -261,7 +263,7 @@ test.describe('Shared-Package CV Flywheel (@ngi/platform-ssot) — Chat, Docking
     records['chat-dock-multi'] = {
       surfaceId: 'chat-dock-multi',
       stage: STAGE === 'before' ? 'before' : 'after',
-      screenshotPath: dockPngPath,
+      screenshotPath: toUiRelativePath(dockPngPath),
       pixelSignals: dockPixels,
       domAudit: dockDom,
       vlmRubric: dockRubric,
@@ -309,7 +311,7 @@ test.describe('Shared-Package CV Flywheel (@ngi/platform-ssot) — Chat, Docking
     records['urbs-civilization'] = {
       surfaceId: 'urbs-civilization',
       stage: STAGE === 'before' ? 'before' : 'after',
-      screenshotPath: urbsPngPath,
+      screenshotPath: toUiRelativePath(urbsPngPath),
       pixelSignals: urbsPixels,
       domAudit: urbsDom,
       vlmRubric: urbsRubric,
@@ -507,7 +509,7 @@ test.describe('Shared-Package CV Flywheel (@ngi/platform-ssot) — Chat, Docking
       afterRecords[surfaceId] = {
         surfaceId,
         stage: 'after',
-        screenshotPath: afterPngPath,
+        screenshotPath: toUiRelativePath(afterPngPath),
         pixelSignals: afterPixels,
         domAudit: afterDom,
         vlmRubric: afterRubric,
@@ -531,7 +533,7 @@ test.describe('Shared-Package CV Flywheel (@ngi/platform-ssot) — Chat, Docking
       beforeRecords[surfaceId] = {
         surfaceId,
         stage: 'before',
-        screenshotPath: existsSync(baselineScreenPath) ? baselineScreenPath : afterPngPath,
+        screenshotPath: toUiRelativePath(existsSync(baselineScreenPath) ? baselineScreenPath : afterPngPath),
         pixelSignals: beforePixels,
         domAudit: beforeDom,
         vlmRubric: beforeRubric,

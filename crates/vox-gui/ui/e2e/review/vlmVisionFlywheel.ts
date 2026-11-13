@@ -18,7 +18,8 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Page } from '@playwright/test';
 import type { GuiDomAuditMetrics } from '../../src/lib/cvFlywheel';
 
@@ -70,49 +71,34 @@ export interface VlmSurfaceCritique {
   actionableDirectives: readonly string[];
 }
 
-const ARTIFACT_BRAIN_DIR =
-  '/Users/brbrainerd/.gemini/antigravity/brain/5ab35f90-0a2d-404f-b4dc-4ff5baf96c5a';
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const UI_ROOT = join(MODULE_DIR, '..', '..');
+const CONCEPT_ART_DIR = 'public/assets/romanesque';
 
 export function conceptArtPlateForSurface(surfaceId: string): string {
   const id = surfaceId.toLowerCase();
-  if (id.includes('gamify') || id.includes('urbs') || id.includes('ludus')) {
-    const v65Urbs = join(
-      ARTIFACT_BRAIN_DIR,
-      'v65_concept_urbs_simulator_white_gold_acropolis_1794158463815.jpg',
-    );
-    if (existsSync(v65Urbs)) return v65Urbs;
-    return join(ARTIFACT_BRAIN_DIR, 'v62_concept_semiotic_urbs_codebase_city_1794147288395.jpg');
+  if (id.includes('overview') || id.includes('aegis') || id.includes('dashboard') || id.includes('work') || id.includes('gamify') || id.includes('urbs') || id.includes('ludus')) {
+    return `${CONCEPT_ART_DIR}/v66-concept-diegetic-urbs-simulator.jpg`;
   }
   if (
+    id.includes('pipeline') ||
+    id.includes('trace') ||
+    id.includes('topology') ||
+    id.includes('flow') ||
+    id.includes('dag') ||
     id.includes('explorer') ||
     id.includes('tasks') ||
     id.includes('runs') ||
-    id.includes('flow') ||
     id.includes('needs-you') ||
     id.includes('harness') ||
     id.includes('river')
   ) {
-    const v65Explorer = join(
-      ARTIFACT_BRAIN_DIR,
-      'v65_concept_explorer_tasks_runs_white_gold_1794158471421.jpg',
-    );
-    if (existsSync(v65Explorer)) return v65Explorer;
+    return `${CONCEPT_ART_DIR}/v66-concept-diegetic-aqueduct-cascade.jpg`;
   }
-  const v65Suite = join(
-    ARTIFACT_BRAIN_DIR,
-    'v65_concept_chat_mens_knowledge_white_gold_1794158501800.jpg',
-  );
-  if (existsSync(v65Suite)) {
-    return v65Suite;
+  if (id.includes('sql') || id.includes('table') || id.includes('catalog') || id.includes('log')) {
+    return `${CONCEPT_ART_DIR}/travertine-parchment-tablet.jpg`;
   }
-  const unifiedSuitePath = join(
-    ARTIFACT_BRAIN_DIR,
-    'v63_concept_gameui_romanesque_unified_suite_1794153259509.jpg',
-  );
-  if (existsSync(unifiedSuitePath)) {
-    return unifiedSuitePath;
-  }
-  return join(ARTIFACT_BRAIN_DIR, 'v60_concept_option_a_slim_medallion_rail_v2_1794137423119.jpg');
+  return `${CONCEPT_ART_DIR}/white-marble-frieze-banner.jpg`;
 }
 
 /**
@@ -125,8 +111,9 @@ export async function extractChromaticSpatialVisionSignals(
   conceptArtPath: string,
 ): Promise<ChromaticSpatialVisionSignals> {
   const screenB64 = screenshotPngBuffer.toString('base64');
+  const resolvedRefPath = isAbsolute(conceptArtPath) ? conceptArtPath : join(UI_ROOT, conceptArtPath);
   const refB64 =
-    existsSync(conceptArtPath) ? readFileSync(conceptArtPath).toString('base64') : null;
+    existsSync(resolvedRefPath) ? readFileSync(resolvedRefPath).toString('base64') : null;
 
   return page.evaluate(
     async ({ sB64, rB64 }) => {
